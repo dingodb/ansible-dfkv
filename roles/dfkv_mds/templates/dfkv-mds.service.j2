@@ -1,0 +1,27 @@
+{# Managed by Ansible.
+
+   The unit is version-independent: it runs `current/<launcher>`, so a release
+   flip swaps the binary underneath without rewriting this file. The launcher
+   reads the node's environment from DFKV_CONF_DIR, which is also
+   version-independent -- that is what lets a node keep its own tuning across an
+   upgrade instead of having it overwritten by the release's defaults. #}
+[Unit]
+Description=dfkv MDS (Membership Directory Service)
+After={{ dfkv_mds_after }}
+Wants=network-online.target
+
+[Service]
+Type=exec
+Environment=DFKV_CONF_DIR={{ dfkv_mds_root }}/conf
+ExecStart={{ dfkv_mds_root }}/current/dfkv_mds_start.sh
+# Restart=always rather than the on-failure in the upstream example, matching
+# what the fleet has actually been running across all eight regions. An MDS that
+# exits cleanly is still an MDS that should come back.
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target

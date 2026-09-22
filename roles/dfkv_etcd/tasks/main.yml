@@ -1,0 +1,271 @@
+---
+# Install and start one etcd member. Greenfield only -- see the guard below.
+
+- name: Check that the current effective user is root
+  assert:
+    that:
+      - ansible_effective_user_id == 0
+    fail_msg: "Must run as root; current user is '{{ ansible_user_id }}'."
+
+- name: Fail when the OS hostname is unavailable
+  # The member name has to be the OS hostname, and it has to be consistent
+  # between the process and every --initial-cluster key. Deriving it here rather
+  # than trusting the inventory keeps the two in step.
+  assert:
+    that:
+      - ansible_hostname | length > 0
+    fail_msg: >-
+      Could not determine the OS hostname of {{ inventory_hostname }}, which
+      etcd needs for both --name and the --initial-cluster keys.
+
+- name: Fail when two members would share an OS hostname
+  # Duplicate names do not fail loudly -- one member overwrites the other's
+  # registration and the quorum ends up a node short while every endpoint still
+  # reports healthy.
+  assert:
+    that:
+      - >-
+        (groups['etcd_servers']
+         | map('extract', hostvars, 'ansible_hostname') | list
+         | length)
+        ==
+        (groups['etcd_servers']
+         | map('extract', hostvars, 'ansible_hostname') | list | unique | length)
+    fail_msg: >-
+      Two etcd members resolve to the same OS hostname. Names in
+      --initial-cluster must be unique.
+
+- name: Check whether etcd is already running
+  command:
+    cmd: systemctl is-active {{ dfkv_etcd_service }}
+  register: dfkv_etcd_active
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Check whether this member has been bootstrapped
+  # etcd ignores every --initial-cluster* flag once the data directory holds a
+  # member, so a restart rejoins the existing cluster rather than forming a new
+  # one. That is what makes this role safe to re-run, and it is why there is no
+  # "refuse to touch a live etcd" guard here: the guard would block the rerun
+  # without protecting anything. The flags only take effect on a member with no
+  # data, which is exactly the case checked below.
+  stat:
+    path: "{{ dfkv_etcd_root }}/etcd-data/member"
+  register: dfkv_etcd_member_data
+
+- name: Fail when etcd is running but has no member data
+  # The one genuinely broken combination: a member that reported itself active
+  # without a member directory is either about to re-bootstrap itself into a
+  # second, competing cluster, or is pointed at the wrong data directory.
+  assert:
+    that:
+      - >-
+        not (dfkv_etcd_active.stdout | default('') == 'active'
+             and not dfkv_etcd_member_data.stat.exists)
+    fail_msg: >-
+      {{ dfkv_etcd_service }} is active on {{ inventory_hostname }} but
+      {{ dfkv_etcd_root }}/etcd-data/member does not exist. This member has no
+      cluster identity, so a restart would bootstrap a second cluster rather
+      than rejoin the existing one. Check where its --data-dir actually points
+      before going further.
+
+- name: Report that this member is already bootstrapped
+  debug:
+    msg: >-
+      {{ dfkv_etcd_service }} is already active on {{ inventory_hostname }}.
+      Keeping its existing member data: this run will update configuration and
+      restart the member onto that data, not re-bootstrap it. To rebuild the
+      member from scratch, remove {{ dfkv_etcd_root }}/etcd-data yourself first
+      -- this role will not do it.
+  when: dfkv_etcd_active.stdout | default('') == 'active'
+
+# ---------------------------------------------------------------------------
+# Obtain the binary
+# ---------------------------------------------------------------------------
+- name: Download etcd on the control node
+  block:
+    - name: Create the control-node staging directory
+      file:
+        path: "{{ dfkv_etcd_stage_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Download the etcd tarball
+      get_url:
+        url: "{{ dfkv_etcd_download_url }}"
+        dest: "{{ dfkv_etcd_stage_dir }}/etcd-{{ dfkv_etcd_version }}-linux-amd64.tar.gz"
+        force: false
+        timeout: 120
+      environment: "{{ dfkv_etcd_proxy_env }}"
+      when: not (dfkv_etcd_use_local_tarball | bool)
+
+    - name: Point at the tarball to push
+      set_fact:
+        dfkv_etcd_source_tarball: >-
+          {{ dfkv_etcd_local_tarball if (dfkv_etcd_use_local_tarball | bool)
+             else dfkv_etcd_stage_dir ~ '/etcd-' ~ dfkv_etcd_version ~ '-linux-amd64.tar.gz' }}
+
+    - name: Fail when the etcd tarball is missing
+      assert:
+        that:
+          - dfkv_etcd_source_tarball is exists
+        fail_msg: >-
+          {{ dfkv_etcd_source_tarball }} does not exist on the control node.
+          Download it by hand and pass -e dfkv_etcd_use_local_tarball=true
+          -e dfkv_etcd_local_tarball=/path/to/etcd-{{ dfkv_etcd_version }}-linux-amd64.tar.gz
+  rescue:
+    - name: Explain how to place the etcd tarball
+      fail:
+        msg: |
+          Could not obtain etcd {{ dfkv_etcd_version }} on the control node.
+
+          Mirror: {{ dfkv_etcd_download_url }}
+
+          The rollout this replaces downloaded the tarball on the master and
+          pushed only the extracted binary. If the mirror is unreachable, fetch
+          etcd elsewhere and hand the tarball over:
+              -e dfkv_etcd_use_local_tarball=true \
+              -e dfkv_etcd_local_tarball=/path/etcd-{{ dfkv_etcd_version }}-linux-amd64.tar.gz
+  delegate_to: localhost
+  run_once: true
+  become: false
+
+- name: Check whether the etcd binaries are already installed
+  stat:
+    path: "{{ dfkv_etcd_root }}/{{ item }}"
+  loop:
+    - etcd
+    - etcdctl
+  register: dfkv_etcd_binary_stat
+
+- name: Install the etcd binaries
+  # Gated on the binaries being absent, so a re-run is a no-op rather than
+  # re-pushing and re-unpacking 23 MB every time. The control-node fetch above
+  # stays unconditional and run_once: moving it inside a per-host `when` is the
+  # classic way to break run_once, because a skipped result carries no `stat`.
+  when: >-
+    dfkv_etcd_binary_stat.results
+    | selectattr('stat.exists', 'eq', false) | list | length > 0
+  block:
+    - name: Push the etcd tarball
+      copy:
+        src: "{{ dfkv_etcd_source_tarball }}"
+        dest: "/tmp/etcd-{{ dfkv_etcd_version }}-linux-amd64.tar.gz"
+        mode: "0644"
+
+    - name: Unpack etcd to a scratch directory
+      unarchive:
+        src: "/tmp/etcd-{{ dfkv_etcd_version }}-linux-amd64.tar.gz"
+        dest: /tmp/etcd-unpack
+        remote_src: true
+
+    - name: Install the etcd binaries
+      copy:
+        src: "/tmp/etcd-unpack/etcd-{{ dfkv_etcd_version }}-linux-amd64/{{ item }}"
+        dest: "{{ dfkv_etcd_root }}/{{ item }}"
+        remote_src: true
+        mode: "0755"
+      loop:
+        - etcd
+        - etcdctl
+      notify: Restart dfkv-etcd
+
+    - name: Remove the pushed tarball and unpack directory
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/etcd-{{ dfkv_etcd_version }}-linux-amd64.tar.gz"
+        - /tmp/etcd-unpack
+
+# ---------------------------------------------------------------------------
+# Configure and start
+# ---------------------------------------------------------------------------
+- name: Create the etcd data directory
+  file:
+    path: "{{ dfkv_etcd_root }}/etcd-data"
+    state: directory
+    # 0700: the member directory holds the raft log and the cluster's entire
+    # authoritative state.
+    mode: "0700"
+
+- name: Deploy the etcd unit
+  template:
+    src: dfkv-etcd.service.j2
+    dest: "/etc/systemd/system/{{ dfkv_etcd_service }}.service"
+    mode: "0644"
+  notify: Restart dfkv-etcd
+
+- name: Deploy the etcd environment file
+  copy:
+    # The node's own client/MDS wiring lives here rather than in the unit, so a
+    # region can point its MDS at a different port without editing a unit.
+    content: |
+      # Managed by Ansible.
+      ETCD_CLIENT_PORT={{ dfkv_etcd_client_port }}
+      ETCD_PEER_PORT={{ dfkv_etcd_peer_port }}
+    dest: "{{ dfkv_etcd_root }}/etcd.env"
+    mode: "0644"
+
+- name: Check whether firewalld is running
+  command:
+    cmd: systemctl is-active firewalld
+  register: dfkv_etcd_firewalld
+  changed_when: false
+  failed_when: false
+
+- name: Open the etcd ports
+  ansible.posix.firewalld:
+    port: "{{ item }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop:
+    - "{{ dfkv_etcd_client_port }}"
+    - "{{ dfkv_etcd_peer_port }}"
+  when: dfkv_etcd_firewalld.stdout | default('') == 'active'
+
+- name: Reload systemd
+  systemd:
+    daemon_reload: true
+
+- name: Enable and start etcd
+  systemd:
+    name: "{{ dfkv_etcd_service }}"
+    enabled: true
+    state: started
+  # Skipped in check mode: on a node that has never had dfkv installed the
+  # unit file was not written during the dry run, so systemd would fail with
+  # "Could not find the requested service" -- and the readiness poll below it
+  # would spin for the full retry budget waiting for a service nothing started.
+  # A dry run should report what it would do and stop, not fail.
+  when: not ansible_check_mode
+
+- name: Apply any pending restart before waiting for readiness
+  # Handlers run at the end of the play by default, which would put the restart
+  # AFTER the readiness wait -- the wait would then measure the process that was
+  # just started and the play would report success while the service was still
+  # coming back up. Measured on bj09-gpu-200b-0022: the play finished, then the
+  # handler restarted the server, and the node read as unreachable for the ~40s
+  # it spent re-registering its RDMA memory regions.
+  #
+  # Flushing here makes the order "start, restart if anything changed, then
+  # wait", which is what the wait was written to assume.
+  meta: flush_handlers
+
+- name: Wait for this member to report healthy
+  command:
+    cmd: >-
+      {{ dfkv_etcd_root }}/etcdctl
+      --endpoints=http://127.0.0.1:{{ dfkv_etcd_client_port }}
+      endpoint health
+  register: dfkv_etcd_health
+  until: dfkv_etcd_health.rc == 0
+  retries: "{{ dfkv_etcd_quorum_wait_retries }}"
+  delay: "{{ dfkv_etcd_quorum_wait_delay }}"
+  changed_when: false
+
+- name: Report the member
+  debug:
+    msg: "{{ dfkv_etcd_name }} healthy on {{ dfkv_etcd_bind_ip }}:{{ dfkv_etcd_client_port }}"

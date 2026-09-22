@@ -1,0 +1,31 @@
+{# Managed by Ansible. Every continuation line below is indented and the
+   backslash escapes the newline, which systemd accepts; without the backslash
+   ExecStart would end at the first line and the rest would be read as unknown
+   directives. #}
+[Unit]
+Description=dfkv etcd ({{ dfkv_etcd_name }})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart={{ dfkv_etcd_root }}/etcd \
+  --name {{ dfkv_etcd_name }} \
+  --data-dir {{ dfkv_etcd_root }}/etcd-data \
+  --listen-client-urls http://{{ dfkv_etcd_bind_ip }}:{{ dfkv_etcd_client_port }},http://127.0.0.1:{{ dfkv_etcd_client_port }} \
+  --advertise-client-urls http://{{ dfkv_etcd_bind_ip }}:{{ dfkv_etcd_client_port }} \
+  --listen-peer-urls http://{{ dfkv_etcd_bind_ip }}:{{ dfkv_etcd_peer_port }} \
+  --initial-advertise-peer-urls http://{{ dfkv_etcd_bind_ip }}:{{ dfkv_etcd_peer_port }} \
+  --initial-cluster {{ dfkv_etcd_cluster }} \
+  --initial-cluster-state new \
+  --initial-cluster-token {{ dfkv_etcd_cluster_token }} \
+  --log-level warn \
+  --quota-backend-bytes {{ dfkv_etcd_quota_bytes }} \
+  --auto-compaction-mode periodic \
+  --auto-compaction-retention {{ dfkv_etcd_auto_compaction_retention }}
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
