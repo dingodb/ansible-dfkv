@@ -1,0 +1,23 @@
+---
+# Playbook: Deploy the per-region telemetry stack.
+#
+# One node per region, normally an MDS. The stack renders from the observability
+# assets shipped inside the release, so the dashboards and alert rules always
+# match the binaries being deployed.
+#
+# Independent of the daemons: this does not touch dfkv_server or dfkv_mds, and
+# the servers do not need it to be up. A region can run without telemetry.
+#
+# The rendered bundle is content-addressed and immutable, so re-deploying the
+# same version with the same inputs is a no-op rather than a restart. A Grafana
+# admin password change is refused rather than applied -- rotating it requires an
+# explicit database rotation, and silently recreating the container would lock
+# out every existing session instead.
+#
+#   ansible-playbook -i <inv> playbooks/07_observability.yml
+- name: Deploy the telemetry stack
+  hosts: observability_servers
+  remote_user: root
+  become: false
+  roles:
+    - dfkv_observability

@@ -1,0 +1,21 @@
+---
+# Playbook: Install and start the etcd quorum (greenfield).
+#
+# Serial, one node at a time. The members bootstrap with
+# --initial-cluster-state new and a cluster that forms in parallel is a cluster
+# that thrashes between candidate leaders.
+#
+# Greenfield only: the role refuses to touch an etcd that is already active, so
+# this cannot be misused as a "re-bootstrap" against a running cluster. etcd is
+# the only authoritative state dfkv has -- the MDS is stateless and the servers
+# hold nothing but a disposable cache -- so losing it means every node has to
+# re-register.
+#
+#   ansible-playbook -i <inv> playbooks/04_etcd.yml
+- name: Bootstrap the etcd quorum
+  hosts: etcd_servers
+  remote_user: root
+  become: false
+  serial: 1
+  roles:
+    - dfkv_etcd

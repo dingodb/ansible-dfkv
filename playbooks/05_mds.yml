@@ -1,0 +1,19 @@
+---
+# Playbook: Deploy dfkv_mds.
+#
+# Assumes the release is already staged (03_release.yml); the role asserts this
+# and fails with a pointer rather than trying to fetch it here.
+#
+# Serial: 1 even though the MDS is stateless and every replica is equivalent.
+# A restarting replica is one fewer endpoint for a connecting server to register
+# against, and the registration deadline is a hard 60s exit -- not a window
+# worth opening on three nodes at once.
+#
+#   ansible-playbook -i <inv> playbooks/05_mds.yml
+- name: Deploy dfkv_mds
+  hosts: mds_servers
+  remote_user: root
+  become: false
+  serial: 1
+  roles:
+    - dfkv_mds
