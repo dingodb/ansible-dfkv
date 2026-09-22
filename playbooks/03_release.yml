@@ -1,0 +1,29 @@
+---
+# Playbook: Stage a dfkv release onto nodes. Nothing is activated.
+#
+# This is the `stage` verb of the fleet tooling it replaces, kept as its own
+# phase because it is the one step that pays for the network twice: the tarball
+# is fetched once on the control node and then pushed to every target, so a
+# 70-node region transfers it 70 times outbound but downloads it once.
+#
+# Order of operations, all of which are gates rather than best-effort:
+#   1. fetch SHA256SUMS, parse out this tarball's hash
+#   2. fetch the tarball with that hash as expected checksum (fail-closed)
+#   3. push, unpack into releases/<ver>.tmp
+#   4. verify the *release's own* SHA256SUMS inside the unpacked tree
+#   5. rename into releases/<ver> atomically
+#
+# Step 4 is not redundant with step 2: it catches a corrupted unpack on the
+# target, which is a different failure from a corrupted download here.
+#
+# Staging is always safe to run ahead of an upgrade window -- it never restarts
+# anything and never touches `current`.
+#
+#   ansible-playbook -i <inv> playbooks/03_release.yml
+#   ansible-playbook -i <inv> playbooks/03_release.yml --limit dfkv-cache-1
+- name: Stage the dfkv release
+  hosts: "{{ target_hosts | default('mds_servers:cache_servers') }}"
+  remote_user: root
+  become: false
+  roles:
+    - dfkv_release

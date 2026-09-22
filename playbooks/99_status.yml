@@ -1,0 +1,109 @@
+---
+# Playbook: Read-only status report. Safe to run at any time, on any cluster.
+#
+# Every task here is `changed_when: false`; this playbook never writes. It
+# prints what each node is running and where it diverges from what the release
+# and inventory say it should be running, which is the first thing to look at
+# when a cluster and the inventory disagree.
+#
+# For the full assertion set (ring membership, etcd registration counts, RDMA
+# depth, RAM arena size) use 09_verify.yml instead -- that one fails, this one
+# only reports.
+#
+#   ansible-playbook -i <inv> playbooks/99_status.yml
+#   ansible-playbook -i <inv> playbooks/99_status.yml --limit dfkv-cache-1
+- name: Report dfkv node status
+  hosts: "{{ target_hosts | default('all') }}"
+  remote_user: root
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Check service state
+      # One shell call for both units: an inactive unit is a normal answer here,
+      # not a failure, so the exit status is discarded rather than branched on.
+      shell:
+        cmd: |
+          for svc in {{ dfkv_server_service }} {{ dfkv_mds_service }} {{ dfkv_etcd_service }}; do
+            printf '%s=%s\n' "$svc" "$(systemctl is-active "$svc" 2>/dev/null || true)"
+          done
+      register: dfkv_status_services
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Show service state
+      debug:
+        msg: "{{ dfkv_status_services.stdout_lines }}"
+
+    - name: Show the staged releases and the current symlink
+      shell:
+        cmd: |
+          printf 'root=%s\n' '{{ dfkv_deploy_root }}'
+          ls -1 '{{ dfkv_deploy_root }}/releases' 2>/dev/null | sed 's/^/release=/'
+          printf 'current=%s\n' "$(readlink -f '{{ dfkv_deploy_root }}/current' 2>/dev/null || echo none)"
+      register: dfkv_status_release
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Show release state
+      debug:
+        msg: "{{ dfkv_status_release.stdout_lines }}"
+
+    - name: Read the running version from the metrics endpoint
+      # The runtime version is the only trustworthy answer to "what is this node
+      # running". A `current` symlink is a statement of intent, and a node that
+      # was dropped from the inventory but never disabled keeps serving happily
+      # while pointing at whatever it was left on.
+      shell:
+        cmd: |
+          for pair in "{{ dfkv_server_service }}:{{ dfkv_server_metrics_port }}" \
+                      "{{ dfkv_mds_service }}:{{ dfkv_mds_metrics_port }}"; do
+            svc="${pair%%:*}"; port="${pair##*:}"
+            v="$(curl -s --max-time 5 "http://127.0.0.1:${port}/metrics" 2>/dev/null \
+                 | grep -o 'version="[0-9.]*"' | head -1)"
+            st="$(systemctl is-active "$svc" 2>/dev/null || echo unavailable)"
+            if [ -n "$v" ]; then
+              printf '%s=%s (service %s)\n' "$svc" "$v" "$st"
+            elif [ "$st" = active ]; then
+              # The listener is not serving yet. That is what a node looks like
+              # for the first 1-2 minutes after a restart: the RAM arena is
+              # pre-touched and the RDMA MRs are registered before metrics come
+              # up, which is why 06_server waits on /readyz rather than assuming.
+              printf '%s=not-serving-yet (service active -- still starting, or wedged)\n' "$svc"
+            else
+              printf '%s=unreachable (service %s)\n' "$svc" "$st"
+            fi
+          done
+      register: dfkv_status_runtime
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Show running versions
+      debug:
+        msg: "{{ dfkv_status_runtime.stdout_lines }}"
+
+    - name: Show data disk usage
+      # Derived, not read from config: the whole point of the ratio model is
+      # that the set of disks is measured on the node. The running server's
+      # --dir is the authoritative answer to which ones it actually got.
+      shell:
+        cmd: |
+          pid="$(pgrep -x dfkv_server | head -1)"
+          if [ -n "$pid" ]; then
+            # Drop argv[0] (the binary path) first, then keep what --dir takes.
+            dirs="$(tr '\0' ' ' < /proc/$pid/cmdline | sed 's/^[^ ]* //; s/.*--dir //; s/ --.*//')"
+            printf 'dirs=%s\n' "$dirs"
+            df -hT $(printf '%s' "$dirs" | tr ',' ' ') 2>/dev/null || echo 'no data directories'
+          else
+            printf 'dfkv_server not running\n'
+          fi
+      register: dfkv_status_disks
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Show disk state
+      debug:
+        msg: "{{ dfkv_status_disks.stdout_lines }}"

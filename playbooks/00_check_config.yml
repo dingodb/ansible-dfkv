@@ -1,0 +1,176 @@
+---
+# Playbook: Check that the inventory supplies everything the roles need.
+#
+# Why this exists: when you run with `-i <env>/<region>/hosts.py`, Ansible loads
+# group_vars only from the inventory source directory and the playbook
+# directory. This repo's `inventory/group_vars/all.yml` does not participate at
+# all. So each region's group_vars/all.yml has to be self-contained, and a
+# variable that is missing there is simply undefined -- which shows up as an
+# undefined-variable error somewhere in the middle of a deploy, pointing at the
+# line that used it rather than at the file that should have defined it.
+#
+# This turns that into one message listing everything the region is missing.
+#
+# Run it before anything else, and before trusting a new region:
+#
+#   ansible-playbook -i <inv> playbooks/00_check_config.yml
+- name: Check the region inventory is complete
+  # hosts: all + connection: local, NOT hosts: localhost. The check is about the
+  # region's group_vars, which do not vary by host -- but targeting localhost
+  # makes it invisible to --limit, so a run scoped to one node would silently
+  # skip the preflight that exists to catch an incomplete region config.
+  hosts: all
+  connection: local
+  gather_facts: false
+  run_once: true
+  vars:
+    # The region directory, taken from the inventory sources on the command
+    # line. NOT `inventory_dir`: that magic variable was removed in ansible-core
+    # 2.21 and is simply undefined now, which shows up as an undefined-variable
+    # error rather than as a deprecation warning.
+    #
+    # ansible-csi-lvm still reads its host_id ledger that way
+    # (`lvm_host_id_map_file: "{{ inventory_dir }}/host_id_map.yml"`), so it is
+    # worth knowing that this breaks on a current ansible-core.
+    dfkv_region_dirs: >-
+      {{ ansible_inventory_sources | map('dirname') | unique | list }}
+
+    # Variables read by a role but defined by no role's defaults, so they have
+    # to come from group_vars. Variables whose name ends up in this list are
+    # exactly the contract between this repo and a region inventory: adding a
+    # new one to a role means adding it here and to every region.
+    #
+    # Deliberately excluded:
+    #   * anything a role declares in its own defaults/ (the role supplies it)
+    #   * anything set at run time with set_fact or register
+    #   * dfkv_upgrade_batch, which is optional and read with a default
+    dfkv_required_vars:
+      # layout and identity
+      - dfkv_root
+      - dfkv_mds_root
+      - dfkv_etcd_root
+      - dfkv_deploy_root
+      - dfkv_disk_subdir
+      - dfkv_server_service
+      - dfkv_mds_service
+      - dfkv_etcd_service
+      - dfkv_cluster_name
+      - dfkv_group
+      # release
+      - dfkv_version
+      - dfkv_release_repo
+      - dfkv_release_mirror
+      - dfkv_release_url_base
+      - dfkv_release_tarball
+      - dfkv_release_stage_dir
+      - dfkv_release_use_local_tarball
+      - dfkv_release_local_tarball
+      - dfkv_release_allow_restage
+      # etcd
+      - dfkv_etcd_quota_bytes
+      - dfkv_etcd_auto_compaction_retention
+      # mds
+      - dfkv_mds_endpoints
+      - dfkv_mds_registration_timeout_ms
+      # server
+      - dfkv_server_port
+      - dfkv_server_rdma_port
+      - dfkv_server_metrics_port
+      - dfkv_server_metrics_bind
+      - dfkv_disk_usage_ratio
+      - dfkv_min_disk_gb
+      - dfkv_cap_bytes
+      - dfkv_weight
+      - dfkv_advertise_iface
+      - dfkv_rdma_dev
+      - dfkv_ram_tier
+      - dfkv_ram_tier_bytes
+      - dfkv_store_engine
+      - dfkv_slab_write
+      - dfkv_disk_hash_weight
+      - dfkv_read_coalesce
+      - dfkv_rdma_depth
+      - dfkv_rdma_recv_segment_size
+      - dfkv_rdma_recv_chunk_bytes
+      - dfkv_rdma_recv_chunk_idle_ms
+      - dfkv_max_msg
+      - dfkv_slab_evict_high_pct
+      - dfkv_slab_evict_low_pct
+      - dfkv_slab_evict_max_extents_per_tick
+      - dfkv_ram_rollout_max_dirty_bytes
+      - dfkv_ram_rollout_max_dirty_age_s
+      - dfkv_limit_memlock
+      - dfkv_limit_nofile
+      - dfkv_service_timeout_start_sec
+      - dfkv_service_timeout_stop_sec
+      # observability
+      - dfkv_observability_secret_file
+      - dfkv_observability_otlp_grpc_port
+      - dfkv_observability_otlp_http_port
+      - dfkv_observability_collector_health_port
+      - dfkv_observability_collector_prom_port
+      - dfkv_observability_prometheus_port
+      - dfkv_observability_tempo_port
+      - dfkv_observability_grafana_port
+      - dfkv_observability_bind_host
+      - dfkv_observability_grafana_bind_host
+      - dfkv_observability_retention_time
+      - dfkv_observability_retention_size
+      - dfkv_observability_remote_write_urls
+  tasks:
+    - name: Fail when the inventories do not share one directory
+      # Both sources belong to the region: hosts.py (cache nodes, from kubectl)
+      # and hosts-nodes.yml (MDS/etcd, static). Splitting them across
+      # directories means group_vars is loaded from only one of them, and which
+      # one depends on argument order.
+      assert:
+        that:
+          - dfkv_region_dirs | length == 1
+        fail_msg: >-
+          The inventory sources are in {{ dfkv_region_dirs | length }} different
+          directories ({{ dfkv_region_dirs | join(', ') }}). They must both live
+          in the region directory, because group_vars is loaded from the
+          inventory source directory and only one of them would apply.
+
+    - name: Find the region's group_vars
+      # Reported so a failure names the file to edit rather than just the
+      # variable that is missing.
+      stat:
+        path: "{{ dfkv_region_dirs | first }}/group_vars/all.yml"
+      register: dfkv_check_region_vars
+
+    - name: Report which inventory is in use
+      debug:
+        msg: >-
+          region directory = {{ dfkv_region_dirs | first }}
+          ({{ 'group_vars/all.yml found' if dfkv_check_region_vars.stat.exists
+              else 'NO group_vars/all.yml here' }})
+
+    - name: Fail when the region's group_vars is missing entirely
+      assert:
+        that:
+          - dfkv_check_region_vars.stat.exists
+        fail_msg: >-
+          {{ dfkv_region_dirs | first }}/group_vars/all.yml does not exist. Copy
+          inventory/group_vars/all.yml from this repo into the region directory
+          and adjust it -- the copy in this repo is a template a region copies,
+          not a layer that loads underneath it.
+
+    - name: Fail when the region inventory is incomplete
+      assert:
+        that:
+          - item in vars
+        fail_msg: >-
+          '{{ item }}' is undefined. Add it to
+          {{ dfkv_region_dirs | first }}/group_vars/all.yml.
+
+          When you run with -i <region>/hosts.py, Ansible loads group_vars only
+          from the inventory source directory, so the region file must be
+          self-contained: this repo's inventory/group_vars/all.yml does not
+          participate. Copy it wholesale and override, rather than listing only
+          the values you want to change.
+      loop: "{{ dfkv_required_vars }}"
+
+    - name: Report success
+      debug:
+        msg: "all {{ dfkv_required_vars | length }} required variables are defined"

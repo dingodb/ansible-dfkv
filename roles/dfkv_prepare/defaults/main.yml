@@ -1,0 +1,41 @@
+---
+# Package sets per family. The RDMA userspace providers are the load-bearing
+# part: exposing an RDMA device to a process does not make it discoverable
+# unless the per-vendor userspace plugins are installed, and the failure mode is
+# an empty device list rather than an error.
+#
+# `ibverbs-providers` is the Debian packaging of exactly that. It is easy to
+# miss, because installing rdma-core + libibverbs1 looks sufficient and gets you
+# a working `ibv_devinfo` on the built-in devices only.
+dfkv_prepare_packages_debian:
+  - rdma-core
+  - libibverbs1
+  - ibverbs-providers
+  - curl
+  - iproute2
+  - tar
+  - gzip
+  - jq
+
+dfkv_prepare_packages_redhat:
+  - rdma-core
+  - libibverbs
+  - libibverbs-utils
+  - infiniband-diags
+  - curl
+  - iproute
+  - tar
+  - gzip
+  - jq
+
+# Directories every node needs before anything is staged into them.
+dfkv_prepare_directories:
+  - "{{ dfkv_deploy_root }}/releases"
+  - "{{ dfkv_deploy_root }}/conf"
+  - "{{ dfkv_deploy_root }}/backup"
+
+# GPUDirect needs nvidia-peermem loaded on the host, otherwise ibv_reg_mr cannot
+# register a CUDA buffer and every GPU-to-cache transfer falls back or fails.
+# Checked on cache nodes only, and reported rather than asserted: a CPU-only
+# dev node has no nvidia driver at all and that is legitimate.
+dfkv_prepare_check_peermem: true

@@ -1,0 +1,26 @@
+---
+# Playbook: Publish the client tree to the shared filesystem.
+#
+# The library and connector packages are read by inference processes out of a
+# shared mount (DingoFS / GPFS), not installed on the node. They are published
+# under an explicit version directory and are **never** exposed through a
+# `current` symlink.
+#
+# That is a deliberate difference from the server side. A symlink flip on a
+# lazily-consistent network filesystem has a cross-node window in which different
+# instances of the same ring resolve `current` to different builds. Mixed client
+# artifacts in one ring is a correctness problem, not a performance one: the
+# engines would key the cache with different layout identities and quietly miss
+# each other. Pod specs must pin `release/<ver>/` explicitly.
+#
+# Publishing is not activation. Cutting a ring over to a new version is a
+# coordinated restart of every engine instance in that ring, done by whoever owns
+# those workloads -- and it must happen inside one window, for the same reason.
+#
+#   ansible-playbook -i <inv> playbooks/08_client.yml
+- name: Publish the dfkv client tree
+  hosts: client_stage
+  remote_user: root
+  become: false
+  roles:
+    - dfkv_client

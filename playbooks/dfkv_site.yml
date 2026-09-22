@@ -1,0 +1,90 @@
+---
+# Master playbook: full greenfield bring-up of a dfkv cluster.
+#
+# This is the ordering the fleet tooling encoded as `deploy`, and it is the only
+# place in this repo where the phases are sequenced. Every phase below is also a
+# standalone playbook -- run it directly to re-apply just that phase.
+#
+# ============================================================
+# Why this order
+# ============================================================
+#   0 prepare     : packages, directories, RDMA provider check.
+#   1 release     : fetch once on the control node, push to every target.
+#                   Nothing is running yet; nothing can be disrupted.
+#   2 etcd        : the only authoritative state in the system. Must be healthy
+#                   before any MDS starts, because an MDS that cannot reach etcd
+#                   exits rather than degrading.
+#   3 mds         : must be up before any server, because a server's first
+#                   registration has a hard 60s deadline and it exits 1 on
+#                   expiry. Servers do not queue waiting for the MDS.
+#   4 server      : the ring itself. Cluster mode engages here.
+#   5 verify      : assert against the ring, not against the inventory.
+#   6 observability: last. Servers do not need it, and bringing it up after the
+#                   ring means its first scrape sees a fully-formed cluster
+#                   instead of filling the dashboards with startup noise.
+#
+# There is deliberately no host-tuning phase between prepare and release. The
+# obvious candidate for one -- jemalloc, hugepages, sysctl, cpupower -- does not
+# apply here, and the settings that do matter are per-service rather than
+# per-host, so they live in the units under roles/dfkv_server and roles/dfkv_etcd
+# where they travel with the service they belong to:
+#
+#   * LimitMEMLOCK=infinity  -- the RAM arena, RDMA memory regions and CUDA
+#     pinned buffers are all locked pages.
+#   * LimitNOFILE=1048576    -- slab in direct mode holds two descriptors per
+#     extent, roughly 10k on a 5 TiB node.
+#   * TimeoutStartSec=600    -- slab pre-touches the arena and registers MRs at
+#     about 5-10s per 16 GiB, overrunning systemd's 90s default.
+#   * OOMScoreAdjust=-500    -- a cache node that dies to the OOM killer is
+#     worse than one that holds its memory.
+#
+# vm.swappiness is in particular not needed: the RAM arena is mlocked, and
+# locked pages are not reclaimable, so swapping cannot touch it.
+#
+# ============================================================
+# Re-running: what happens on the second run, phase by phase
+# ============================================================
+#   0 prepare     : no-op (packages and directories).
+#   1 release     : no-op. The release directory is immutable; re-staging the
+#                   same version with a changed launcher fails rather than
+#                   silently rewriting a directory a rollback depends on.
+#   2 etcd        : REFUSES TO RUN if etcd is already active. Re-bootstrapping a
+#                   live quorum destroys the member set.
+#   3 mds         : rewrites env/unit only if their content changed; restarts
+#                   only on change.
+#   4 server      : same. A converged server is not restarted, so its RAM arena
+#                   and open connections survive a re-run.
+#   5 verify      : read-only.
+#   6 observability: content-addressed bundle; same inputs means no restart.
+#
+# ============================================================
+# Preflight
+#
+# Worth its own step rather than relying on the first task that happens to use a
+# variable: a region whose group_vars is incomplete fails here, naming the file
+# and the missing variable, instead of part-way through a deploy pointing at the
+# line that read it.
+# ============================================================
+- name: "Preflight: region inventory is complete"
+  import_playbook: 00_check_config.yml
+
+- name: "Phase 0: System preparation"
+  import_playbook: 01_prepare.yml
+
+- name: "Phase 1: Stage the release"
+  import_playbook: 03_release.yml
+
+- name: "Phase 2: etcd quorum"
+  import_playbook: 04_etcd.yml
+
+- name: "Phase 3: dfkv_mds"
+  import_playbook: 05_mds.yml
+
+- name: "Phase 4: dfkv_server"
+  import_playbook: 06_server.yml
+
+- name: "Phase 5: Verify"
+  import_playbook: 09_verify.yml
+
+- name: "Phase 6: Telemetry stack"
+  import_playbook: 07_observability.yml

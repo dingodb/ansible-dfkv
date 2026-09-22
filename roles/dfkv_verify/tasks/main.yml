@@ -1,0 +1,198 @@
+---
+# Verify a deployed cluster. Read-only.
+
+- name: Check whether the release is staged on the admin node
+  # stat, NOT `is directory`: Jinja's file tests resolve against the CONTROL
+  # node's filesystem, not the target's.
+  stat:
+    path: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}"
+  register: dfkv_verify_release_stat
+
+- name: Fail early when the release is not staged on the admin node
+  assert:
+    that:
+      - dfkv_verify_release_stat.stat.isdir | default(false)
+    fail_msg: >-
+      {{ dfkv_deploy_root }}/releases/{{ dfkv_version }} is not staged on
+      {{ inventory_hostname }}, so there is no dfkvctl to verify with.
+
+- name: Fail early when no MDS endpoints are known
+  assert:
+    that:
+      - dfkv_mds_endpoints | length > 0
+    fail_msg: >-
+      dfkv_mds_endpoints is empty. It is derived from the mds_servers group, so
+      this usually means the run was given only the region's hosts.py and not
+      its hosts-mds.yml. Pass both inventory sources.
+
+- name: Set the dfkvctl path
+  set_fact:
+    dfkv_verify_ctl: "{{ dfkv_deploy_root }}/current/bin/dfkvctl"
+
+- name: Read the ring
+  command:
+    cmd: >-
+      {{ dfkv_verify_ctl }} ring
+      --mds {{ dfkv_mds_endpoints }}
+      --group {{ item }}
+  loop: "{{ dfkv_verify_groups }}"
+  register: dfkv_verify_ring
+  changed_when: false
+  failed_when: false
+  timeout: "{{ dfkv_verify_timeout }}"
+
+- name: Fail when a ring cannot be read
+  assert:
+    that:
+      - item.rc == 0
+    fail_msg: >-
+      `dfkvctl ring --group {{ item.item }}` failed with rc={{ item.rc }}:
+      {{ item.stderr | default('') | trim }}. A ring that cannot be read is not
+      an empty ring -- check the MDS endpoints and that at least one replica is
+      ready before reading anything into the member count.
+  loop: "{{ dfkv_verify_ring.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Count the members the ring reports
+  # `ver=` appears once per member line, so counting it counts members. There is
+  # deliberately no fallback heuristic for output that does not match: a guess
+  # that counts the wrong thing produces a plausible number, and a plausible
+  # number is what gets a broken cluster signed off. An honest 0 trips the
+  # "ring is empty" assertion instead.
+  set_fact:
+    dfkv_verify_counts: >-
+      {{ dfkv_verify_counts | default([]) + [{
+           'group': item.item,
+           'total': item.stdout | regex_findall('ver=') | length,
+           'at_version': item.stdout | regex_findall('ver=' ~ (dfkv_version | regex_escape) ~ '([, ]|$)') | length,
+           'at_depth': item.stdout | regex_findall('qd=' ~ (dfkv_rdma_depth | string) ~ '([, ]|$)') | length,
+           'at_ram': item.stdout | regex_findall('ram=' ~ (dfkv_verify_expected_ram | string) ~ '([, ]|$)') | length,
+         }] }}
+  loop: "{{ dfkv_verify_ring.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Show what the ring reports
+  debug:
+    msg: >-
+      group={{ item.group }} ring={{ item.total }}
+      at-version={{ item.at_version }} at-depth={{ item.at_depth }} at-ram={{ item.at_ram }}
+  loop: "{{ dfkv_verify_counts }}"
+
+# ---------------------------------------------------------------------------
+# Assertions.
+#
+# The first one is the important one. "Every node in the inventory is
+# reachable" is not the same claim as "every node in the ring is running the
+# version we think it is", and only the second one catches a node that is
+# serving traffic while missing from the inventory.
+# ---------------------------------------------------------------------------
+- name: Fail when the ring is empty
+  assert:
+    that:
+      - item.total > 0
+    fail_msg: >-
+      The ring for group {{ item.group }} reports no members. Every server in
+      this group is either down, unregistered, or pointed at a different group.
+  loop: "{{ dfkv_verify_counts }}"
+
+- name: Fail when a ring member is not running the target version
+  # The real inspection criterion. This is the check that catches a node left
+  # behind by a partial upgrade -- and, unlike walking the inventory, it also
+  # catches a node that is not in the inventory at all.
+  assert:
+    that:
+      - item.at_version == item.total
+    fail_msg: >-
+      group {{ item.group }}: {{ item.total - item.at_version }} of
+      {{ item.total }} ring members are not on version {{ dfkv_version }}.
+      Inspect with:
+        {{ dfkv_verify_ctl }} ring --mds {{ dfkv_mds_endpoints }} --group {{ item.group }}
+        | tail -n +3 | grep -v 'ver={{ dfkv_version }}'
+      which must print nothing when the ring is converged.
+  loop: "{{ dfkv_verify_counts }}"
+
+- name: Fail when a ring member is not running the declared RDMA depth
+  assert:
+    that:
+      - item.at_depth == item.total
+    fail_msg: >-
+      group {{ item.group }}: {{ item.total - item.at_depth }} of
+      {{ item.total }} ring members report an RDMA depth other than
+      {{ dfkv_rdma_depth }}. A member whose depth is below the client's fails
+      every RDMA write; one above it wastes receive buffers.
+  loop: "{{ dfkv_verify_counts }}"
+  when: dfkv_rdma_depth | default(0) | int > 0
+
+- name: Fail when a ring member reports a different RAM arena
+  assert:
+    that:
+      - item.at_ram == item.total
+    fail_msg: >-
+      group {{ item.group }}: {{ item.total - item.at_ram }} of
+      {{ item.total }} ring members report a RAM arena other than
+      {{ dfkv_verify_expected_ram }} bytes. The ring reports the fixed arena
+      truth, which is the configured budget minus the two oversized extents
+      reserved on each side, rounded down to the page. A member with a
+      different value was configured with a different budget.
+  loop: "{{ dfkv_verify_counts }}"
+  when: dfkv_ram_tier | bool
+
+# ---------------------------------------------------------------------------
+# etcd membership.
+#
+# The ring is what the MDS believes; etcd is what the servers actually
+# registered. Comparing the two is what catches a split between them, which is
+# exactly the state an etcd NOSPACE alarm produces: `dfkvctl ring` reports
+# members=0, the MDS error counters climb, and every dfkv_server keeps serving
+# RDMA traffic perfectly while having silently fallen out of the ring.
+# ---------------------------------------------------------------------------
+- name: Count the registrations in etcd
+  command:
+    argv:
+      - "{{ dfkv_etcd_root }}/etcdctl"
+      - "--endpoints=http://127.0.0.1:{{ dfkv_etcd_client_port }}"
+      - get
+      - "{{ dfkv_verify_etcd_prefix }}/{{ item }}/members/"
+      - --prefix
+      - --count-only
+  loop: "{{ dfkv_verify_groups }}"
+  register: dfkv_verify_etcd
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ groups['etcd_servers'][0] }}"
+
+- name: Fail when a registration count cannot be read
+  assert:
+    that:
+      - item.rc == 0
+    fail_msg: >-
+      Could not count registrations for group {{ item.item }} in etcd:
+      {{ item.stderr | default('') | trim }}. If etcd is reachable but this
+      fails, check for an ALARM: a NOSPACE alarm leaves a cluster that looks up
+      and answers perfectly while refusing writes.
+  loop: "{{ dfkv_verify_etcd.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Compare the ring against etcd
+  assert:
+    that:
+      - (item.1.stdout | regex_findall('[0-9]+') | first | int) == item.0.total
+    fail_msg: >-
+      group {{ item.0.group }}: etcd holds
+      {{ item.1.stdout | regex_findall('[0-9]+') | first | default('?') }}
+      registrations but the ring reports {{ item.0.total }} members. The MDS
+      view and the registered member set disagree -- check for an etcd NOSPACE
+      alarm (`etcdctl alarm list`, `etcdctl endpoint status`) before restarting
+      anything.
+  loop: "{{ dfkv_verify_counts | zip(dfkv_verify_etcd.results) | list }}"
+  loop_control:
+    label: "{{ item.0.group }}"
+
+- name: Report
+  debug:
+    msg: >-
+      verify: version={{ dfkv_version }} groups={{ dfkv_verify_groups | join(',') }}
+      {{ dfkv_verify_counts | map(attribute='group') | zip(dfkv_verify_counts | map(attribute='total')) | map('join', '=') | join(' ') }}

@@ -1,0 +1,5 @@
+---
+# No handlers. The stack is brought up by an explicit compose task at the end of
+# the role, not by a restart handler: `compose up -d` reconciles whatever
+# changed, and a restart handler would tear down containers that are already
+# correct.

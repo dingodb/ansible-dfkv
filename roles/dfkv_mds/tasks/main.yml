@@ -1,0 +1,176 @@
+---
+# Deploy one dfkv_mds replica. Assumes the release is already staged.
+
+- name: Check whether the release is staged on this node
+  # stat, NOT `is directory`: Jinja's file tests resolve against the CONTROL
+  # node's filesystem, not the target's.
+  stat:
+    path: "{{ dfkv_mds_root }}/releases/{{ dfkv_version }}"
+  register: dfkv_mds_release_stat
+
+- name: Fail early when the release is not staged
+  # Failing here with a pointer beats letting the unit start against a `current`
+  # symlink that points at nothing, or -- worse -- at a previous version that
+  # happens to still be there.
+  assert:
+    that:
+      - dfkv_mds_release_stat.stat.isdir | default(false)
+    fail_msg: >-
+      {{ dfkv_mds_root }}/releases/{{ dfkv_version }} is not staged on
+      {{ inventory_hostname }}. Run playbooks/03_release.yml first.
+
+- name: Check whether this repo staged that release
+  stat:
+    path: "{{ dfkv_mds_root }}/releases/{{ dfkv_version }}/.dfkv-release.json"
+  register: dfkv_mds_release_marker
+
+- name: Fail when the staged release was not staged by this repo
+  # The environment file and the launcher are a matched pair: the launcher reads
+  # the variable names the template writes. A release staged by the fleet tooling
+  # carries a different launcher whose names differ, and a mismatch does NOT
+  # fail -- the launcher falls back to its defaults:
+  #
+  #   measured on bj09-gpu-200b-0022, 2026-09-22: the node's weight fell from 2
+  #   to 1 and its 192 GiB RAM tier was turned off, while the service reported
+  #   healthy and the playbook reported success.
+  #
+  # So refuse rather than write an environment file nothing will read correctly.
+  assert:
+    that:
+      - dfkv_mds_release_marker.stat.exists
+    fail_msg: >-
+      {{ dfkv_mds_root }}/releases/{{ dfkv_version }} exists but carries no marker
+      from this repo, so the launcher inside it is not the one this role's
+      environment file is written for. Running anyway would leave
+      {{ inventory_hostname }} on a mismatched pair, which degrades silently:
+      settings the launcher does not recognise fall back to their defaults.
+
+      Re-stage it so both halves come from this repo, then re-run this playbook:
+
+          ansible-playbook -i <inv> playbooks/03_release.yml \
+            -e dfkv_version={{ dfkv_version }} \
+            -e dfkv_release_allow_restage=true
+
+      playbooks/dfkv_site.yml does this for you, because it runs 03_release first.
+
+- name: Fail early when the etcd endpoint carries a scheme
+  # dfkv_mds prefixes the scheme itself, so "http://host:port" becomes
+  # "http://http://host:port" and every etcd call fails -- which reads like an
+  # etcd outage rather than a typo. The launcher checks this too; catching it
+  # here means a bad group_vars value fails at deploy rather than at boot.
+  assert:
+    that:
+      - "'://' not in dfkv_mds_etcd"
+    fail_msg: >-
+      dfkv_mds_etcd is '{{ dfkv_mds_etcd }}'. It must be host:port with no
+      scheme -- dfkv_mds adds the scheme itself.
+
+- name: Check where current points
+  # follow: false so this reports the link itself, not its target.
+  stat:
+    path: "{{ dfkv_mds_root }}/current"
+    follow: false
+  register: dfkv_mds_current_link
+
+- name: Fail when current points at a different release
+  # Repointing an existing link is an ACTIVATION, not a deploy. 03_release.yml
+  # deliberately only stages, and 10_upgrade.yml owns the flip. Doing it here
+  # would mean a reconverge run silently moved a node between versions.
+  assert:
+    that:
+      - >-
+        dfkv_mds_current_link.stat.lnk_target | default('') | basename == dfkv_version
+    fail_msg: >-
+      {{ dfkv_mds_root }}/current points at
+      {{ dfkv_mds_current_link.stat.lnk_target | default('?') }}, not releases/{{ dfkv_version }}.
+      Repointing it is an activation: run
+      playbooks/10_upgrade.yml -e dfkv_version={{ dfkv_version }} instead.
+  when: dfkv_mds_current_link.stat.exists
+
+- name: Point current at this release on a first deploy
+  # A node that has never had dfkv installed has no `current` at all, and
+  # nothing else creates one -- 03_release.yml only stages. Without this the
+  # unit would exec a path that does not exist and fail with status=203/EXEC,
+  # which reads like a broken binary rather than a missing symlink.
+  file:
+    src: "{{ dfkv_mds_root }}/releases/{{ dfkv_version }}"
+    dest: "{{ dfkv_mds_root }}/current"
+    state: link
+    force: true
+  when: not dfkv_mds_current_link.stat.exists
+
+- name: Deploy the MDS environment file
+  template:
+    src: dfkv-mds.env.j2
+    dest: "{{ dfkv_mds_root }}/conf/dfkv-mds.env"
+    mode: "0644"
+  notify: Restart dfkv-mds
+
+- name: Back up any existing unit before replacing it
+  copy:
+    src: "/etc/systemd/system/{{ dfkv_mds_service }}.service"
+    dest: "{{ dfkv_mds_root }}/backup/{{ dfkv_mds_service }}.service.pre-ansible"
+    remote_src: true
+    mode: "0644"
+  register: dfkv_mds_unit_backup
+  failed_when: false
+  changed_when: false
+
+- name: Deploy the MDS unit
+  template:
+    src: dfkv-mds.service.j2
+    dest: "/etc/systemd/system/{{ dfkv_mds_service }}.service"
+    mode: "0644"
+  notify: Restart dfkv-mds
+
+- name: Reload systemd
+  systemd:
+    daemon_reload: true
+
+- name: Enable and start dfkv_mds
+  systemd:
+    name: "{{ dfkv_mds_service }}"
+    enabled: true
+    state: started
+  # Skipped in check mode: on a node that has never had dfkv installed the
+  # unit file was not written during the dry run, so systemd would fail with
+  # "Could not find the requested service" -- and the readiness poll below it
+  # would spin for the full retry budget waiting for a service nothing started.
+  # A dry run should report what it would do and stop, not fail.
+  when: not ansible_check_mode
+
+- name: Apply any pending restart before waiting for readiness
+  # Handlers run at the end of the play by default, which would put the restart
+  # AFTER the readiness wait -- the wait would then measure the process that was
+  # just started and the play would report success while the service was still
+  # coming back up. Measured on bj09-gpu-200b-0022: the play finished, then the
+  # handler restarted the server, and the node read as unreachable for the ~40s
+  # it spent re-registering its RDMA memory regions.
+  #
+  # Flushing here makes the order "start, restart if anything changed, then
+  # wait", which is what the wait was written to assume.
+  meta: flush_handlers
+
+- name: Wait for the MDS to report ready
+  # /readyz, not /healthz. /healthz is process liveness only -- it deliberately
+  # does not probe etcd, so that an etcd outage does not turn into a crash-loop
+  # storm. /readyz is the debounced etcd probe, and it is what decides whether
+  # this replica should receive traffic.
+  uri:
+    url: "http://127.0.0.1:{{ dfkv_mds_metrics_port }}/readyz"
+    status_code: [200]
+  register: dfkv_mds_ready
+  until: dfkv_mds_ready.status | default(0) == 200
+  retries: "{{ dfkv_mds_ready_retries }}"
+  delay: "{{ dfkv_mds_ready_delay }}"
+  changed_when: false
+  # Skipped in check mode: on a node that has never had dfkv installed the
+  # unit file was not written during the dry run, so systemd would fail with
+  # "Could not find the requested service" -- and the readiness poll below it
+  # would spin for the full retry budget waiting for a service nothing started.
+  # A dry run should report what it would do and stop, not fail.
+  when: not ansible_check_mode
+
+- name: Report the replica
+  debug:
+    msg: "dfkv_mds listening on {{ dfkv_mds_listen_port }}, etcd={{ dfkv_mds_etcd }}"

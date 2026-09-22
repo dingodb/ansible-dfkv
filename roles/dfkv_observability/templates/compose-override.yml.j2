@@ -1,0 +1,27 @@
+{# Managed by Ansible. Layered on top of the release's docker-compose.yml.
+
+   Port bindings are re-stated here because the upstream file publishes them on
+   127.0.0.1 unconditionally, and OTLP has to be reachable from the GPU nodes to
+   receive pushed connector telemetry. #}
+services:
+  otel-collector:
+    ports:
+      - "{{ dfkv_observability_bind_host }}:{{ dfkv_observability_otlp_grpc_port }}:4317"
+      - "{{ dfkv_observability_bind_host }}:{{ dfkv_observability_otlp_http_port }}:4318"
+      - "127.0.0.1:{{ dfkv_observability_collector_health_port }}:13133"
+      - "127.0.0.1:{{ dfkv_observability_collector_prom_port }}:8889"
+  prometheus:
+    ports:
+      - "{{ dfkv_observability_bind_host }}:{{ dfkv_observability_prometheus_port }}:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time={{ dfkv_observability_retention_time }}
+      - --storage.tsdb.retention.size={{ dfkv_observability_retention_size }}
+      - --enable-feature=exemplar-storage
+      - --storage.tsdb.wal-compression
+  tempo:
+    ports:
+      - "{{ dfkv_observability_bind_host }}:{{ dfkv_observability_tempo_port }}:3200"
+  grafana:
+    ports:
+      - "{{ dfkv_observability_grafana_bind_host }}:{{ dfkv_observability_grafana_port }}:3000"

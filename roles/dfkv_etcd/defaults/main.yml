@@ -1,0 +1,50 @@
+---
+# etcd is a third-party prerequisite: it ships in neither the dfkv release
+# tarball nor this repo, and it is pinned independently of dfkv's version.
+
+dfkv_etcd_version: v3.5.17
+dfkv_etcd_download_url: "https://mirrors.huaweicloud.com/etcd/{{ dfkv_etcd_version }}/etcd-{{ dfkv_etcd_version }}-linux-amd64.tar.gz"
+
+# Deliberately NOT dfkv_release_proxy: the mirror is domestic, and routing it
+# through a proxy that exists to reach github.com usually breaks it. Set this
+# only if the control node genuinely needs a proxy to reach the mirror.
+dfkv_etcd_proxy: ""
+dfkv_etcd_proxy_env: >-
+  {{ ({'https_proxy': dfkv_etcd_proxy, 'http_proxy': dfkv_etcd_proxy}
+      if (dfkv_etcd_proxy | length > 0) else {}) }}
+
+# Control-node scratch. Set dfkv_etcd_local_tarball to skip the download
+# entirely and push a tarball handed over out of band.
+dfkv_etcd_stage_dir: "{{ dfkv_release_stage_dir | default('/root/dfkv-release') }}"
+dfkv_etcd_local_tarball: ""
+dfkv_etcd_use_local_tarball: false
+
+dfkv_etcd_client_port: 23790
+dfkv_etcd_peer_port: 23791
+dfkv_etcd_cluster_token: "dfkv-default"
+
+# etcd's --name and the --initial-cluster keys must be the node's *OS* hostname,
+# not the inventory name. They are the same in most regions but need not be --
+# cache nodes take their inventory name from the k8s node object. A mismatch
+# produces a member that comes up, looks healthy, and is invisible to the rest
+# of the quorum.
+dfkv_etcd_name: "{{ ansible_hostname }}"
+
+# Address the member advertises. Defaults to whatever the inventory connects to,
+# which in these regions is already the storage network.
+dfkv_etcd_bind_ip: "{{ ansible_host }}"
+
+# name=ip for every member, built from the inventory rather than maintained by
+# hand. The fleet tooling this replaces kept the same list in a hand-edited
+# mds.txt on each region's master, which is a file that can be wrong in a way
+# nothing detects until a member fails to find itself in the cluster.
+dfkv_etcd_cluster: >-
+  {{ groups['etcd_servers'] | default([])
+     | map('extract', hostvars, 'ansible_hostname')
+     | zip(groups['etcd_servers'] | default([])
+           | map('extract', hostvars, 'ansible_host') | list)
+     | map('join', '=')
+     | join(',') }}
+
+dfkv_etcd_quorum_wait_retries: 60
+dfkv_etcd_quorum_wait_delay: 2

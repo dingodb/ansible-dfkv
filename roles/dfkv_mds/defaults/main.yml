@@ -1,0 +1,22 @@
+---
+# dfkv_mds is stateless: the authoritative membership state lives in etcd, and a
+# restarted replica re-reads it. Nothing here persists between runs except the
+# environment file, which is version-independent on purpose so a release flip
+# does not rewrite node-local wiring.
+
+dfkv_mds_service: dfkv-mds
+dfkv_mds_listen_port: 28250
+dfkv_mds_metrics_port: 28260
+dfkv_mds_metrics_bind: 0.0.0.0
+dfkv_mds_etcd: "127.0.0.1:23790"
+dfkv_mds_accept_legacy: false
+
+# Only add the etcd unit as a start dependency where etcd is colocated. On a
+# dedicated MDS node the ordering would be a dependency on a unit that does not
+# exist there.
+dfkv_mds_after: >-
+  network-online.target{{ ' ' ~ dfkv_etcd_service ~ '.service'
+                          if inventory_hostname in (groups['etcd_servers'] | default([])) else '' }}
+
+dfkv_mds_ready_retries: 60
+dfkv_mds_ready_delay: 2

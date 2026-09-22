@@ -1,0 +1,16 @@
+*.retry
+*.pyc
+__pycache__/
+.vault_pass
+*.vault
+.env
+
+# Pulled release tarballs and their checksum files land here on the control node
+# (roles/dfkv_release, dfkv_release_stage_dir).
+*.tar.gz
+*.tar.gz.sha256
+
+# claude
+.claude
+CLAUDE.md
+CLAUDE.original.md

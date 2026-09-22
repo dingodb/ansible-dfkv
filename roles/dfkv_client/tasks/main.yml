@@ -1,0 +1,180 @@
+---
+# Publish the versioned client tree to the shared filesystem. Read-only with
+# respect to every running workload.
+
+- name: Fail early when the client directory is unset
+  assert:
+    that:
+      - (dfkv_client_dir | default('')) | length > 0
+    fail_msg: >-
+      dfkv_client_dir is unset. It is the shared-filesystem root the inference
+      Pods read from (a DingoFS or GPFS mount), not a local path.
+
+- name: Check whether the release is staged on this node
+  # stat, NOT `is directory`: Jinja's file tests resolve against the CONTROL
+  # node's filesystem, not the target's.
+  stat:
+    path: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}"
+  register: dfkv_client_release_stat
+
+- name: Fail early when the release is not staged
+  assert:
+    that:
+      - dfkv_client_release_stat.stat.isdir | default(false)
+    fail_msg: >-
+      {{ dfkv_deploy_root }}/releases/{{ dfkv_version }} is not staged on
+      {{ inventory_hostname }}. Run playbooks/03_release.yml first.
+
+- name: Check for the client tree in the staged release
+  stat:
+    path: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}/{{ item }}"
+  loop: "{{ dfkv_client_required_paths }}"
+  register: dfkv_client_tree_stat
+
+- name: Fail early when the release has no client tree
+  # A release with the daemons but no libdfkv.so / python / integration is a
+  # server-only build. Publishing it would replace a working client tree with an
+  # incomplete one.
+  assert:
+    that:
+      - >-
+        dfkv_client_tree_stat.results
+        | selectattr('stat.exists', 'eq', false) | list | length == 0
+    fail_msg: >-
+      The staged release {{ dfkv_version }} is missing
+      {{ dfkv_client_tree_stat.results | selectattr('stat.exists', 'eq', false)
+         | map(attribute='item') | join(', ') }}.
+      It is not a complete client tree; refusing to publish it over the one in
+      {{ dfkv_client_dir }}.
+
+- name: Confirm the shared filesystem is mounted
+  command:
+    cmd: "findmnt -T {{ dfkv_client_dir }}"
+  register: dfkv_client_mount
+  changed_when: false
+
+- name: Record the target release directory
+  set_fact:
+    dfkv_client_release_dir: "{{ dfkv_client_dir }}/release/{{ dfkv_version }}"
+    dfkv_client_tmp_dir: "{{ dfkv_client_dir }}/release/.{{ dfkv_version }}.incoming"
+
+- name: Check for an existing published build
+  stat:
+    path: "{{ dfkv_client_release_dir }}/lib/libdfkv.so"
+    checksum_algorithm: sha256
+  register: dfkv_client_existing
+
+- name: Checksum the library in the staged release
+  stat:
+    path: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}/lib/libdfkv.so"
+    checksum_algorithm: sha256
+  register: dfkv_client_staged_lib
+
+- name: Refuse to replace a published build with different bytes
+  assert:
+    that:
+      - >-
+        (not dfkv_client_existing.stat.exists) or
+        (dfkv_client_existing.stat.checksum == dfkv_client_staged_lib.stat.checksum)
+    fail_msg: >-
+      {{ dfkv_client_release_dir }}/lib/libdfkv.so already exists with different
+      contents (published
+      {{ dfkv_client_existing.stat.checksum | default('?') }}, staged
+      {{ dfkv_client_staged_lib.stat.checksum | default('?') }}). Two nodes
+      resolving this path to different artifacts is the exact failure the
+      versioned layout exists to prevent. Publish a new version instead, or
+      re-run with -e dfkv_client_force=true if you are deliberately replacing a
+      bad build that never left this stage.
+
+- name: Remove any leftover staging directory
+  file:
+    path: "{{ dfkv_client_tmp_dir }}"
+    state: absent
+
+- name: Create the staging directory
+  file:
+    path: "{{ dfkv_client_tmp_dir }}/lib"
+    state: directory
+    mode: "0755"
+
+- name: Publish the client library
+  copy:
+    src: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}/lib/libdfkv.so"
+    dest: "{{ dfkv_client_tmp_dir }}/lib/libdfkv.so"
+    remote_src: true
+    mode: "0644"
+
+- name: Publish the client tools
+  copy:
+    src: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}/bin/"
+    dest: "{{ dfkv_client_tmp_dir }}/bin/"
+    remote_src: true
+    mode: "0755"
+
+- name: Publish the Python packages
+  copy:
+    src: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}/{{ item }}/"
+    dest: "{{ dfkv_client_tmp_dir }}/{{ item }}/"
+    remote_src: true
+    mode: "0644"
+  loop:
+    - python
+    - integration
+
+- name: Clean bytecode caches from the staging directory
+  # __pycache__ written by the build machine carries absolute paths from that
+  # machine and, on a shared filesystem, can be picked up by every consumer.
+  shell:
+    cmd: find . -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null; true
+    chdir: "{{ dfkv_client_tmp_dir }}"
+  changed_when: false
+
+- name: Stamp the published version
+  copy:
+    content: "{{ dfkv_version }}\n"
+    dest: "{{ dfkv_client_tmp_dir }}/VERSION"
+    mode: "0644"
+
+- name: Write the client runtime environment
+  copy:
+    content: |
+      # Managed by Ansible. Read by inference Pods at start-up.
+      #
+      # DFKV_LIB is deliberately not set here: each Pod pins its own
+      # release/<ver>/ path, so that a rollover is a deliberate edit rather than
+      # something that follows a pointer.
+      DFKV_RDMA_DEPTH={{ dfkv_client_rdma_depth }}
+      DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES={{ dfkv_client_rdma_connection_min_block_bytes }}
+    dest: "{{ dfkv_client_tmp_dir }}/client-runtime.env"
+    mode: "0644"
+
+- name: Make the published tree world-readable
+  # The consumers are inference processes, typically not running as root.
+  file:
+    path: "{{ dfkv_client_tmp_dir }}"
+    state: directory
+    mode: "0755"
+    recurse: true
+
+- name: Move the staged tree into place
+  # Atomic within the shared filesystem: consumers see either the previous build
+  # or the complete new one, never a half-copied tree.
+  command:
+    cmd: "mv {{ dfkv_client_tmp_dir }} {{ dfkv_client_release_dir }}"
+  register: dfkv_client_publish
+  changed_when: true
+  when: >-
+    (not dfkv_client_existing.stat.exists) or (dfkv_client_force | bool)
+
+- name: Report the published client
+  debug:
+    msg:
+      - "published {{ dfkv_version }} to {{ dfkv_client_release_dir }}"
+      - "DFKV_LIB   = {{ dfkv_client_release_dir }}/lib/libdfkv.so"
+      - "PYTHONPATH = {{ dfkv_client_release_dir }}/python"
+      - "connector extra-config lib_path = {{ dfkv_client_release_dir }}/lib/libdfkv.so"
+      - "DFKV_RDMA_DEPTH = {{ dfkv_client_rdma_depth }} / DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES = {{ dfkv_client_rdma_connection_min_block_bytes }}"
+      - >-
+        Not activated. Every engine instance in a ring must cut over inside one
+        window -- engines on different builds of the same ring derive different
+        cache identities and miss each other.

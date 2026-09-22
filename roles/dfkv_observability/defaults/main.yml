@@ -1,0 +1,71 @@
+---
+# The per-region telemetry stack: OTel Collector, Prometheus, Tempo, Grafana.
+#
+# It renders from the observability assets shipped inside the release, so
+# dashboards and alert rules always match the binaries being deployed. The
+# upstream docker-compose.yml is already driven by DFKV_* environment variables,
+# so most of a region's differences are expressible in a .env file instead of a
+# re-rendered compose -- unlike the shell tooling this replaces, which rebuilt
+# the whole compose file and had to be kept in step with upstream by hand.
+#
+# What genuinely cannot come from .env is rendered here:
+#   * prometheus.yml -- the scrape targets are this region's nodes, and they are
+#     deliberately the *declared* set rather than the live ring, so a node that
+#     falls out of the ring does not also vanish from monitoring.
+#   * tempo retention -- the rollout override.
+
+dfkv_observability_enabled: true
+dfkv_observability_root: /root/dfkv-observability
+dfkv_observability_project: dfkv-observability
+
+# Assets inside the release directory, as published by deploy/package_release.sh
+# and carried through by the release staging role.
+dfkv_observability_assets: observability
+dfkv_observability_compose_file: docker-compose.yml
+
+# Container runtime. Auto-detected; override to pin one.
+dfkv_observability_runtime: ""
+
+# Everything that changes what gets rendered. The bundle directory is named
+# after a hash of this, so identical inputs reuse a revision instead of
+# restarting a healthy stack -- and a changed input produces a new revision
+# rather than mutating one that is running.
+dfkv_observability_render_inputs:
+  cluster_name: "{{ dfkv_cluster_name }}"
+  version: "{{ dfkv_version }}"
+  otlp_grpc: "{{ dfkv_observability_otlp_grpc_port }}"
+  otlp_http: "{{ dfkv_observability_otlp_http_port }}"
+  collector_health: "{{ dfkv_observability_collector_health_port }}"
+  collector_prom: "{{ dfkv_observability_collector_prom_port }}"
+  prometheus: "{{ dfkv_observability_prometheus_port }}"
+  tempo: "{{ dfkv_observability_tempo_port }}"
+  grafana: "{{ dfkv_observability_grafana_port }}"
+  bind_host: "{{ dfkv_observability_bind_host }}"
+  grafana_bind_host: "{{ dfkv_observability_grafana_bind_host }}"
+  retention_time: "{{ dfkv_observability_retention_time }}"
+  retention_size: "{{ dfkv_observability_retention_size }}"
+  remote_write: "{{ dfkv_observability_remote_write_urls }}"
+  servers: "{{ groups['cache_servers'] | default([]) | sort }}"
+  mds: "{{ groups['mds_servers'] | default([]) | sort }}"
+  servers_ip: >-
+    {{ groups['cache_servers'] | default([]) | sort
+       | map('extract', hostvars, 'ansible_host') | list }}
+  mds_ip: >-
+    {{ groups['mds_servers'] | default([]) | sort
+       | map('extract', hostvars, 'ansible_host') | list }}
+
+# The revision identifier: the first 12 hex characters of a hash over the render
+# inputs. Stable across runs, and changes exactly when the render would.
+dfkv_observability_revision: >-
+  {{ (dfkv_observability_render_inputs | to_json) | hash('sha256') | truncate(12, true, '') }}
+
+dfkv_observability_release_name: "{{ dfkv_version }}-{{ dfkv_observability_revision }}"
+
+dfkv_observability_health_retries: 60
+dfkv_observability_health_delay: 2
+
+# Populated at run time from dfkv_observability_secret_file; declared here so
+# the template renders on its own and a reordering that skipped the secret tasks
+# fails in the upstream compose file -- which refuses to start without a
+# password -- rather than as an undefined-variable error at template time.
+dfkv_observability_grafana_password: ""

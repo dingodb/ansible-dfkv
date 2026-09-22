@@ -1,0 +1,71 @@
+---
+# dfkv_release owns two things: the contents of a release directory, and the
+# flip-and-restart that activates one.
+#
+# Why the launcher scripts live in this role rather than in dfkv_server /
+# dfkv_mds, where they would read more naturally: a launcher is *release
+# content*. It is staged into releases/<ver>/ and then never rewritten, so that
+# a rollback which flips `current` back to an older release also restores the
+# older launcher. A shared launcher would pass newer flags to an older binary.
+# The service roles install the unit, which points at current/<launcher>.
+
+# Which side of the cluster this node is. Derived from group membership, never
+# from the hostname -- see dfkv_deploy_root in inventory/group_vars/all.yml.
+dfkv_release_is_mds: "{{ inventory_hostname in (groups['mds_servers'] | default([])) }}"
+
+# Proxy for the control-node fetch. The control node has no `gh`, so releases
+# come over HTTPS; where that only works through a proxy, these carry it.
+# Defaults mirror the shell convention so an operator who already has the
+# exports set does not have to restate them.
+dfkv_release_proxy: "{{ lookup('env', 'https_proxy') }}"
+dfkv_release_all_proxy: "{{ lookup('env', 'all_proxy') }}"
+dfkv_release_proxy_env: >-
+  {{ ({'https_proxy': dfkv_release_proxy, 'http_proxy': dfkv_release_proxy, 'all_proxy': dfkv_release_all_proxy}
+      if (dfkv_release_proxy | length > 0) else {}) }}
+
+# The tarball the control node pushes from. Either a published download or a
+# file handed to us out of band; the gate below applies to both.
+dfkv_release_source_tarball: >-
+  {{ dfkv_release_local_tarball if (dfkv_release_use_local_tarball | bool)
+     else dfkv_release_stage_dir ~ '/' ~ dfkv_release_tarball }}
+
+# Filled in from the release's published SHA256SUMS. Empty when the tarball was
+# supplied locally, in which case there is nothing to compare against and the
+# in-tarball manifest is the only check left.
+dfkv_release_expected_sha256: ""
+
+dfkv_release_launcher_name: "{{ 'dfkv_mds_start.sh' if dfkv_release_is_mds | bool else 'dfkv_server_start.sh' }}"
+dfkv_release_service: "{{ dfkv_mds_service if dfkv_release_is_mds | bool else dfkv_server_service }}"
+dfkv_release_metrics_port: "{{ dfkv_mds_metrics_port if dfkv_release_is_mds | bool else dfkv_server_metrics_port }}"
+
+# Stage-only by default. 03_release.yml leaves this false; 10_upgrade.yml sets
+# it true. Keeping both phases on one code path is deliberate: the fleet tooling
+# this replaces had a single switch_one() doing flip + restart + wait + verify,
+# and its rollback subcommand was literally the upgrade subcommand pointed at an
+# older version. Two implementations of "activate a release" would drift.
+dfkv_release_activate: false
+
+# Where the tarball is unpacked before being renamed into place. The rename is
+# what makes a half-unpacked tree impossible to activate.
+dfkv_release_tmp_suffix: ".incoming"
+
+# Flags the deployment depends on. Checked against the staged binary's --help
+# before the release is activated, so a tarball that predates a knob this
+# deployment sets fails here rather than at first restart.
+#
+# --rdma-recv-chunk-bytes is the one that has actually bitten: it arrived in the
+# release containing DingoCache PR #359, and a deployment that set
+# SERVER_RDMA_RECV_CHUNK_BYTES against an older artifact started servers that
+# silently ignored a hard receive-pool budget.
+dfkv_server_required_flags:
+  - --rdma-recv-chunk-bytes
+  - --rdma-recv-segment-size
+  - --ram-tier
+  - --disk-hash-weight
+
+# Seconds to wait for the restarted service to report the target version. Slab
+# pre-touches its RAM arena and registers MRs at roughly 5-10s per 16 GiB, so a
+# 128 GiB arena needs over a minute of startup -- hence a budget far above
+# systemd's default readiness expectations.
+dfkv_release_ready_retries: 90
+dfkv_release_ready_delay: 2

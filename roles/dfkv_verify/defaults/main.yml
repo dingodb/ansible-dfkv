@@ -1,0 +1,37 @@
+---
+# Verification asserts against the ring, not against the inventory.
+#
+# The fleet tooling this replaces walked nodes.txt and reported a healthy
+# cluster for 13 days while a node that had been removed from the list -- but
+# never disabled -- came back on reboot, re-registered into the ring and served
+# 2.7% of the keyspace. It was invisible because it was no longer in the list
+# being walked. Any check that iterates over the inventory has the same hole.
+#
+# So: the ring is asked what it thinks it contains, and that answer is compared
+# against what the region declares. A count mismatch is reported as a mismatch.
+# hd02 carries a known hardware-failed node whose gap is deliberately preserved
+# in both the ring count and the monitoring target count; narrowing the
+# expectation to make the output green is not an option this role offers.
+
+dfkv_verify_groups:
+  - "{{ dfkv_group }}"
+
+# Groups the region declares, for the membership expectation. Defaults to the
+# number of cache nodes in the inventory; a region using per-host group
+# overrides sets this explicitly.
+dfkv_verify_expected_members: 0
+
+# Server -> MDS registration lives in etcd under this prefix.
+dfkv_verify_etcd_prefix: /dfkv/v1/groups
+
+# The arena size the ring will report, which is not the configured budget.
+# The ring reports the fixed arena truth: the budget minus two oversized-value
+# extents reserved on each side, rounded down to the 4 KiB page.
+dfkv_verify_ram_reserve_bytes: 67108864
+dfkv_verify_expected_ram: >-
+  {{ (((dfkv_ram_tier_bytes | int)
+       - ([dfkv_verify_ram_reserve_bytes | int,
+           (dfkv_ram_tier_bytes | int) - 4096] | min))
+      // 4096 * 4096) }}
+
+dfkv_verify_timeout: 30

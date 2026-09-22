@@ -1,0 +1,32 @@
+---
+# Playbook: Verify a deployed cluster.
+#
+# This is the part worth doing properly, because the failure it guards against is
+# the one that looks green. The fleet tooling it replaces walked `nodes.txt` and
+# reported a fully healthy cluster for 13 days while a node that had been dropped
+# from the list and never disabled came back on reboot, re-registered into the
+# ring and served 2.7% of the keyspace -- invisible, because it was no longer in
+# the list being walked.
+#
+# So verification asserts against the ring, not against the inventory:
+#
+#   * every member in the ring reports the target version (not: every node in
+#     the inventory is reachable)
+#   * the ring's member count matches the expected count
+#   * etcd's member registration count matches the same expectation
+#   * RDMA depth and RAM arena size match the declared values on every member
+#
+# A count mismatch is reported as a mismatch, never narrowed to make it pass.
+# hd02 carries a known hardware-failed node whose gap is deliberately preserved
+# in both the ring count and the monitoring target count.
+#
+# Expects dfkvctl. Runs from the admin group against one representative node.
+#
+#   ansible-playbook -i <inv> playbooks/09_verify.yml
+- name: Verify the dfkv cluster
+  hosts: admin
+  remote_user: root
+  become: false
+  gather_facts: false
+  roles:
+    - dfkv_verify

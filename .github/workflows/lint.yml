@@ -1,0 +1,77 @@
+---
+# Deliberately minimal, matching ansible-dingofs: parse every YAML file, then
+# --syntax-check every playbook. There is no ansible-lint / yamllint / molecule
+# here on purpose -- a second opinion on style is not worth a red CI on an
+# unrelated rule change, and every real defect this repo has hit so far was
+# either invalid YAML or a playbook that would not load.
+name: yaml
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  yaml:
+    name: YAML & playbook syntax
+    runs-on: ubuntu-latest
+    env:
+      ANSIBLE_STDOUT_CALLBACK: ansible.builtin.default
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.yml
+
+      # ansible (the bundle) rather than `ansible-galaxy collection install -r
+      # requirements.yml`: galaxy spends ~140s in its dependency-map phase on
+      # every run. requirements.yml stays as the dependency declaration.
+      - name: Install Ansible
+        run: pip install ansible
+
+      - name: Parse every YAML file
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import sys
+          import yaml
+
+
+          class Loader(yaml.SafeLoader):
+              """Tolerate unknown tags (e.g. !vault); only validate syntax."""
+
+
+          Loader.add_multi_constructor("", lambda loader, suffix, node: None)
+
+          files = sorted(
+              p for p in pathlib.Path(".").rglob("*")
+              if p.suffix in (".yml", ".yaml") and ".git" not in p.parts
+          )
+          failed = False
+          for f in files:
+              try:
+                  yaml.load(f.read_text(), Loader=Loader)
+              except yaml.YAMLError as e:
+                  first = str(e).splitlines()[0]
+                  print(f"::error file={f}::{first}")
+                  failed = True
+          print(f"parsed {len(files)} files")
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: Syntax-check every playbook
+        run: |
+          failed=0
+          for pb in playbooks/*.yml; do
+            if ansible-playbook --syntax-check -i inventory/hosts.yml "$pb" >/dev/null 2>&1; then
+              echo "ok   $pb"
+            else
+              echo "FAIL $pb"
+              ansible-playbook --syntax-check -i inventory/hosts.yml "$pb" 2>&1 | tail -20
+              failed=1
+            fi
+          done
+          exit $failed

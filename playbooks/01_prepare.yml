@@ -1,0 +1,15 @@
+---
+# Playbook: System preparation for every dfkv node.
+#
+# Runs against all three roles by default, not just cache nodes: the RDMA
+# userspace provider package set is needed by dfkv_server, and keeping one
+# package baseline across the fleet means a re-imaged node needs exactly one
+# pass to become deployable.
+#
+# Idempotent: package installs, directory creation and the RDMA device probe.
+- name: Prepare dfkv nodes
+  hosts: "{{ target_hosts | default('all') }}"
+  remote_user: root
+  become: false
+  roles:
+    - dfkv_prepare

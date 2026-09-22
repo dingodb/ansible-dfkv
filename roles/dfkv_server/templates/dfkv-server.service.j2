@@ -1,0 +1,43 @@
+{# Managed by Ansible.
+
+   The unit is version-independent: ExecStart runs `current/<launcher>`, so a
+   release flip swaps the binary without rewriting this file, and the launcher
+   carries the flags that match whichever release is current. See
+   roles/dfkv_release/files/dfkv_server_start.sh for why the launcher is
+   versioned with the release rather than shared. #}
+[Unit]
+Description=dfkv storage server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+Environment=DFKV_CONF_DIR={{ dfkv_root }}/conf
+ExecStart={{ dfkv_root }}/current/dfkv_server_start.sh
+# Restart=always, matching the fleet this replaces. The server deliberately
+# exits 1 when its first MDS registration misses the deadline, and a cache node
+# that comes back on its own is worth more than one that stays down waiting for
+# an operator to notice.
+Restart=always
+RestartSec=5
+
+# Slab in direct mode holds two descriptors per extent -- roughly 10k on a 5 TiB
+# node. The default 1024 is not close.
+LimitNOFILE={{ dfkv_limit_nofile }}
+
+# The RAM arena, RDMA memory regions and CUDA pinned buffers are all locked
+# pages. Without this the server aborts on its first ibv_reg_mr.
+LimitMEMLOCK={{ dfkv_limit_memlock }}
+
+# Slab pre-touches the arena and registers MRs at roughly 5-10s per 16 GiB, so a
+# 128 GiB arena overruns systemd's 90s default and the unit is killed part-way
+# through every startup -- which looks like a crash loop, not a slow start.
+TimeoutStartSec={{ dfkv_service_timeout_start_sec }}
+TimeoutStopSec={{ dfkv_service_timeout_stop_sec }}
+
+# A cache node evicted by the OOM killer takes its RAM tier with it and leaves
+# the ring short.
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target

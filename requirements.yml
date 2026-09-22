@@ -1,0 +1,17 @@
+---
+# Ansible collections required by the playbooks and roles in this repo.
+#
+#   ansible-galaxy collection install -r requirements.yml
+#
+# This list is deliberately short, and should stay that way: every collection
+# added here is one more thing a control node needs before it can deploy, and
+# the CI installs the `ansible` bundle rather than resolving this file (galaxy's
+# dependency-map phase costs ~140s per run).
+#
+# Modules used from these:
+#   ansible.posix -> firewalld   (roles/dfkv_etcd, and only when firewalld is
+#                                 actually running -- most regions use neither)
+#
+# Everything else comes from ansible-core itself.
+collections:
+  - name: ansible.posix

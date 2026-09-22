@@ -1,0 +1,11 @@
+---
+- name: Restart dfkv-mds
+  systemd:
+    name: "{{ dfkv_mds_service }}"
+    state: restarted
+    daemon_reload: true
+  # Skipped in check mode. Handlers still run during a dry run, and on a node
+  # that has never had dfkv installed the unit file was only "would be"
+  # written -- so systemd would fail with "Could not find the requested
+  # service", which is the wrong way for a dry run to end.
+  when: not ansible_check_mode

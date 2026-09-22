@@ -1,0 +1,51 @@
+---
+# Playbook: Rolling upgrade of an already-serving cluster.
+#
+# Stage first -- this playbook activates, it does not fetch:
+#
+#   ansible-playbook -i <inv> playbooks/03_release.yml
+#   ansible-playbook -i <inv> playbooks/10_upgrade.yml
+#
+# Activation per node is: RAM gate -> flip the `current` symlink -> restart ->
+# poll the metrics endpoint until it reports the target version -> RAM gate
+# again. The symlink flip is the whole upgrade; configuration and data are
+# version-independent and are not rewritten. Rollback is the same playbook
+# pointed at the previous version, which is why `rollback` is not a separate
+# code path here any more than it was in the fleet tooling.
+#
+# Batch size is about live clients, not node count. A ring with no registered
+# consumers can be taken in one pass; a ring serving inference needs small
+# batches. Measured on xn01: 47 nodes at batch=4 with 32 live clients, zero
+# disconnects. Override with -e dfkv_upgrade_batch=N.
+#
+#   ansible-playbook -i <inv> playbooks/10_upgrade.yml -e dfkv_upgrade_batch=4
+#   ansible-playbook -i <inv> playbooks/10_upgrade.yml --limit dfkv-cache-1
+
+# MDS first. dfkv_mds serves the topology RPC, and an older MDS does not
+# recognise kListTopology -- a modern server polling it fails the call and keeps
+# its last-good ring. Nothing breaks immediately, which is exactly the problem:
+# the ring silently freezes at whatever the last successful poll returned.
+# NOTE: the fleet tooling this replaces rolled servers first and only then called
+# upgrade-mds, apparently by accident of how its subcommands were ordered rather
+# than by intent. This playbook follows the upstream deployment guide instead.
+- name: Roll dfkv_mds forward
+  hosts: mds_servers
+  remote_user: root
+  become: false
+  serial: 1
+  gather_facts: false
+  vars:
+    dfkv_release_activate: true
+  roles:
+    - dfkv_release
+
+- name: Roll dfkv_server forward
+  hosts: "{{ target_hosts | default('cache_servers') }}"
+  remote_user: root
+  become: false
+  serial: "{{ dfkv_upgrade_batch | default(8) }}"
+  gather_facts: false
+  vars:
+    dfkv_release_activate: true
+  roles:
+    - dfkv_release
