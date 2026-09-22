@@ -1,0 +1,373 @@
+---
+# Deploy one dfkv_server cache node. Assumes the release is already staged.
+#
+# Order matters: the data directories are established and their count is known
+# before the capacity is validated, because whether a capacity is legal depends
+# on how many disks it gets split across.
+
+- name: Check whether the release is staged on this node
+  # stat, NOT `is directory`. Jinja's file tests resolve against the CONTROL
+  # node's filesystem, so `is directory` here asks whether the ansible host has
+  # /root/dfkv2 -- which it does not -- and the role would refuse to run against
+  # a node that is in fact perfectly staged.
+  stat:
+    path: "{{ dfkv_root }}/releases/{{ dfkv_version }}"
+  register: dfkv_server_release_stat
+
+- name: Fail early when the release is not staged
+  assert:
+    that:
+      - dfkv_server_release_stat.stat.isdir | default(false)
+    fail_msg: >-
+      {{ dfkv_root }}/releases/{{ dfkv_version }} is not staged on
+      {{ inventory_hostname }}. Run playbooks/03_release.yml first.
+
+- name: Check whether this repo staged that release
+  stat:
+    path: "{{ dfkv_root }}/releases/{{ dfkv_version }}/.dfkv-release.json"
+  register: dfkv_server_release_marker
+
+- name: Fail when the staged release was not staged by this repo
+  # The environment file and the launcher are a matched pair: the launcher reads
+  # the variable names the template writes. A release staged by the fleet tooling
+  # carries a different launcher whose names differ, and a mismatch does NOT
+  # fail -- the launcher falls back to its defaults:
+  #
+  #   measured on bj09-gpu-200b-0022, 2026-09-22: the node's weight fell from 2
+  #   to 1 and its 192 GiB RAM tier was turned off, while the service reported
+  #   healthy and the playbook reported success.
+  #
+  # So refuse rather than write an environment file nothing will read correctly.
+  assert:
+    that:
+      - dfkv_server_release_marker.stat.exists
+    fail_msg: >-
+      {{ dfkv_root }}/releases/{{ dfkv_version }} exists but carries no marker
+      from this repo, so the launcher inside it is not the one this role's
+      environment file is written for. Running anyway would leave
+      {{ inventory_hostname }} on a mismatched pair, which degrades silently:
+      settings the launcher does not recognise fall back to their defaults.
+
+      Re-stage it so both halves come from this repo, then re-run this playbook:
+
+          ansible-playbook -i <inv> playbooks/03_release.yml \
+            -e dfkv_version={{ dfkv_version }} \
+            -e dfkv_release_allow_restage=true
+
+      playbooks/dfkv_site.yml does this for you, because it runs 03_release first.
+
+- name: Fail early when the node has no advertise interface
+  # --advertise is how peers reach this node on the RDMA port, and it is derived
+  # from ADV_IFACE. The launcher fails on an empty value too, but at boot, where
+  # the message is one line in the journal; here it fails the deploy.
+  assert:
+    that:
+      - dfkv_advertise_iface | length > 0
+    fail_msg: >-
+      dfkv_advertise_iface is unset on {{ inventory_hostname }}. It names the
+      interface whose IPv4 becomes --advertise; without it the node registers
+      with an address no peer can reach. Set it as a host variable on
+      cache_servers.
+
+- name: Resolve this node's RDMA devices
+  # dfkv_rdma_dev takes either a literal list or shell-style patterns:
+  #
+  #   dfkv_rdma_dev: "ib7s400p0,ib7s400p1,ib7s400p2,ib7s400p3"   # exact
+  #   dfkv_rdma_dev: "ib7s400p*"                                 # this node's rails
+  #
+  # The pattern form is what lets one region value cover node types with
+  # different rail counts. bj09 needs it: its 200b nodes have ib7s400p0-7 while
+  # its 300x node has only p0-3, so a literal region default is wrong on one of
+  # them. Naming a device that is not there does not degrade loudly -- dfkv just
+  # gets a narrower whitelist and moves less data than its peers -- so the
+  # literal form is validated at phase 0 by dfkv_prepare, and a pattern that
+  # matches nothing fails the assertion below.
+  shell:
+    cmd: |
+      for spec in {{ dfkv_rdma_dev | default('') | split(',') | select | list | join(' ') }}; do
+        for path in /sys/class/infiniband/$spec; do
+          [ -e "$path" ] || continue
+          printf '%s\n' "${path##*/}"
+        done
+      done
+  register: dfkv_server_rdma_dev_shell
+  changed_when: false
+  check_mode: false
+  when: dfkv_rdma_dev | default('') | length > 0
+
+- name: Record the resolved RDMA devices
+  set_fact:
+    dfkv_rdma_dev_resolved: "{{ dfkv_server_rdma_dev_shell.stdout_lines | default([]) }}"
+
+- name: Fail when the RDMA specification matches no device on this node
+  assert:
+    that:
+      - dfkv_rdma_dev_resolved | length > 0
+    fail_msg: >-
+      dfkv_rdma_dev is '{{ dfkv_rdma_dev }}', which resolved to no RDMA device on
+      {{ inventory_hostname }}. Devices present:
+      {{ dfkv_prepare_ib_names | default([]) | join(', ') }}.
+      Either the pattern does not match this node's naming, or the devices are
+      not present at all.
+  when: dfkv_rdma_dev | default('') | length > 0
+
+- name: Choose the data disks and derive the capacity
+  include_tasks: select_disks.yml
+
+- name: Check where current points
+  # follow: false so this reports the link itself, not its target.
+  stat:
+    path: "{{ dfkv_root }}/current"
+    follow: false
+  register: dfkv_server_current_link
+
+- name: Fail when current points at a different release
+  # Repointing an existing link is an ACTIVATION, not a deploy. 03_release.yml
+  # deliberately only stages, and 10_upgrade.yml owns the flip. Doing it here
+  # would mean a reconverge run silently moved a node between versions.
+  assert:
+    that:
+      - >-
+        dfkv_server_current_link.stat.lnk_target | default('') | basename == dfkv_version
+    fail_msg: >-
+      {{ dfkv_root }}/current points at
+      {{ dfkv_server_current_link.stat.lnk_target | default('?') }}, not releases/{{ dfkv_version }}.
+      Repointing it is an activation: run
+      playbooks/10_upgrade.yml -e dfkv_version={{ dfkv_version }} instead.
+  when: dfkv_server_current_link.stat.exists
+
+- name: Point current at this release on a first deploy
+  # A node that has never had dfkv installed has no `current` at all, and
+  # nothing else creates one -- 03_release.yml only stages. Without this the
+  # unit would exec a path that does not exist and fail with status=203/EXEC,
+  # which reads like a broken binary rather than a missing symlink.
+  file:
+    src: "{{ dfkv_root }}/releases/{{ dfkv_version }}"
+    dest: "{{ dfkv_root }}/current"
+    state: link
+    force: true
+  when: not dfkv_server_current_link.stat.exists
+
+- name: Create the data directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ dfkv_server_data_dirs }}"
+
+# ---------------------------------------------------------------------------
+# Capacity changes are gated.
+#
+# A fresh node has no environment file yet and skips this. An existing node
+# whose derived capacity no longer matches what it is running has to be
+# acknowledged, because the change is not a no-op: slab lays down one extent
+# file per GiB of --cap, and whether a running node can carry a different
+# capacity into its existing directory -- or needs a clean one -- is not
+# something this repo asserts. Verify on a canary first.
+# ---------------------------------------------------------------------------
+- name: Read the capacity this node is actually running with
+  # From the running process, not from the file. A fleet-managed node's env
+  # carries a global CAP plus a SERVER_CAP_MAP that overrides it per host, so
+  # grepping the file reports the global default rather than this node's value:
+  # it quoted 10242 GiB for a node actually running 6144 (bj09-gpu-200b-0022,
+  # 2026-09-22). The process's own --cap has no such ambiguity.
+  #
+  # Falls back to the file when the service is not running, resolving the map
+  # the same way the launcher does.
+  shell:
+    cmd: |
+      python3 - <<'PYEOF'
+      import os, sys
+
+      for entry in sorted(os.listdir("/proc")):
+          if not entry.isdigit():
+              continue
+          try:
+              with open("/proc/%s/comm" % entry) as fh:
+                  if fh.read().strip() != "dfkv_server":
+                      continue
+              with open("/proc/%s/cmdline" % entry, "rb") as fh:
+                  argv = fh.read().split(b"\0")
+          except OSError:
+              continue
+          for i, tok in enumerate(argv):
+              if tok == b"--cap" and i + 1 < len(argv):
+                  print(argv[i + 1].decode())
+                  sys.exit(0)
+
+      try:
+          with open("{{ dfkv_root }}/conf/dfkv-server.env") as fh:
+              lines = fh.read().splitlines()
+      except OSError:
+          sys.exit(0)
+
+      def value_of(key):
+          for line in lines:
+              if line.startswith(key + "="):
+                  return line.split("=", 1)[1].strip().strip('"')
+          return ""
+
+      cap = value_of("CAP")
+      node = os.uname().nodename
+      for item in value_of("SERVER_CAP_MAP").split(";"):
+          if ":" in item and item.split(":", 1)[0] == node:
+              cap = item.split(":", 1)[1]
+      if cap:
+          print(cap)
+      PYEOF
+  register: dfkv_server_current_cap
+  changed_when: false
+  # check_mode: false so that `--check` still measures the node. A dry run
+  # that skipped this would leave the derived facts undefined and fail in
+  # the next task, which is a worse answer than not supporting --check.
+  check_mode: false
+
+- name: Note whether the capacity is changing
+  set_fact:
+    dfkv_server_cap_changed: >-
+      {{ (dfkv_server_current_cap.stdout | trim | length > 0)
+         and (dfkv_server_current_cap.stdout | trim) != (dfkv_effective_cap | string) }}
+
+- name: Fail when the capacity would change without permission to discard the cache
+  assert:
+    that:
+      - >-
+        not (dfkv_server_cap_changed | bool)
+        or (dfkv_server_wipe_on_capacity_change | bool)
+    fail_msg: >-
+      {{ inventory_hostname }} is running with
+      CAP={{ dfkv_server_current_cap.stdout | trim }}
+      ({{ (dfkv_server_current_cap.stdout | trim | int / 1073741824) | round(0) }} GiB)
+      but this configuration derives {{ dfkv_effective_cap }}
+      ({{ (dfkv_effective_cap | int / 1073741824) | round(0) }} GiB).
+
+      slab will NOT reopen a directory laid out for a different capacity -- it
+      fails with "existing slab layout differs from requested geometry" and the
+      service ends up in a restart loop. Measured on bj09-gpu-200b-0022,
+      2026-09-22. So a capacity change on a running node is not a configuration
+      edit; it means discarding that node's cache.
+
+      That is what dfkv_server_wipe_on_capacity_change does, and it is the only
+      way through:
+
+          -e dfkv_server_wipe_on_capacity_change=true
+
+      It stops the service, removes the data directories, and lets dfkv recreate
+      them at the new capacity. The cache is regenerable, but the node serves
+      misses until it refills -- run it in a window, and one node at a time
+      (see serial in playbooks/06_server.yml).
+
+      A node whose capacity already matches is untouched by this flag.
+
+- name: Discard the existing cache to change capacity
+  # Guarded by dfkv_server_cap_changed, so this only ever fires on the nodes
+  # whose capacity is actually different. A region-wide run therefore cannot
+  # wipe a node that is already at the derived capacity, and a wrong --limit is
+  # bounded by which nodes disagree rather than by which nodes were named.
+  when:
+    - dfkv_server_cap_changed | bool
+    - dfkv_server_wipe_on_capacity_change | bool
+  block:
+    - name: Stop the server before touching its data
+      systemd:
+        name: "{{ dfkv_server_service }}"
+        state: stopped
+
+    - name: Remove the data directories laid out at the old capacity
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ dfkv_server_data_dirs }}"
+
+    - name: Recreate them empty
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ dfkv_server_data_dirs }}"
+
+    - name: Report the discard
+      debug:
+        msg: >-
+          Discarded {{ (dfkv_server_current_cap.stdout | trim | int / 1073741824)
+          | round(0) }} GiB of cache on {{ inventory_hostname }} to change
+          capacity to {{ (dfkv_effective_cap | int / 1073741824) | round(0) }} GiB.
+          This node serves misses until the ring refills it.
+
+- name: Deploy the server environment file
+  template:
+    src: dfkv-server.env.j2
+    dest: "{{ dfkv_root }}/conf/dfkv-server.env"
+    mode: "0644"
+  notify: Restart dfkv-server
+
+- name: Back up any existing unit before replacing it
+  copy:
+    src: "/etc/systemd/system/{{ dfkv_server_service }}.service"
+    dest: "{{ dfkv_root }}/backup/{{ dfkv_server_service }}.service.pre-ansible"
+    remote_src: true
+    mode: "0644"
+  failed_when: false
+  changed_when: false
+
+- name: Deploy the server unit
+  template:
+    src: dfkv-server.service.j2
+    dest: "/etc/systemd/system/{{ dfkv_server_service }}.service"
+    mode: "0644"
+  notify: Restart dfkv-server
+
+- name: Reload systemd
+  systemd:
+    daemon_reload: true
+
+- name: Enable and start dfkv_server
+  systemd:
+    name: "{{ dfkv_server_service }}"
+    enabled: true
+    state: started
+  # Skipped in check mode: on a node that has never had dfkv installed the
+  # unit file was not written during the dry run, so systemd would fail with
+  # "Could not find the requested service" -- and the readiness poll below it
+  # would spin for the full retry budget waiting for a service nothing started.
+  # A dry run should report what it would do and stop, not fail.
+  when: not ansible_check_mode
+
+- name: Apply any pending restart before waiting for readiness
+  # Handlers run at the end of the play by default, which would put the restart
+  # AFTER the readiness wait -- the wait would then measure the process that was
+  # just started and the play would report success while the service was still
+  # coming back up. Measured on bj09-gpu-200b-0022: the play finished, then the
+  # handler restarted the server, and the node read as unreachable for the ~40s
+  # it spent re-registering its RDMA memory regions.
+  #
+  # Flushing here makes the order "start, restart if anything changed, then
+  # wait", which is what the wait was written to assume.
+  meta: flush_handlers
+
+- name: Wait for the server to report ready
+  # /readyz means startup complete *and* first MDS registration succeeded. A
+  # server that is listening but not registered is exactly the state that looks
+  # fine in `systemctl status` and is missing from the ring.
+  uri:
+    url: "http://127.0.0.1:{{ dfkv_server_metrics_port }}/readyz"
+    status_code: [200]
+  register: dfkv_server_ready
+  until: dfkv_server_ready.status | default(0) == 200
+  retries: "{{ dfkv_server_ready_retries }}"
+  delay: "{{ dfkv_server_ready_delay }}"
+  changed_when: false
+  # Skipped in check mode: on a node that has never had dfkv installed the
+  # unit file was not written during the dry run, so systemd would fail with
+  # "Could not find the requested service" -- and the readiness poll below it
+  # would spin for the full retry budget waiting for a service nothing started.
+  # A dry run should report what it would do and stop, not fail.
+  when: not ansible_check_mode
+
+- name: Report the node
+  debug:
+    msg: >-
+      dfkv_server group={{ dfkv_group }} id={{ ansible_hostname }}
+      cap={{ dfkv_effective_cap }} ({{ (dfkv_effective_cap | int / 1073741824) | round(0) }} GiB)
+      weight={{ dfkv_effective_weight }}
+      dirs={{ dfkv_server_data_dirs | join(',') }}

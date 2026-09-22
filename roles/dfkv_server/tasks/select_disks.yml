@@ -1,0 +1,180 @@
+---
+# Choose the data disks and derive the capacity from them.
+#
+# Ported from roles/dingo_cache in ansible-dingofs on purpose, so both systems on
+# a GPU node select disks the same way:
+#
+#   1. discover every /mnt/disk*
+#   2. drop anything below dfkv_min_disk_gb
+#   3. keep only the largest same-size group (within tolererance)
+#   4. per-disk share = smallest disk in that group x dfkv_disk_usage_ratio,
+#      rounded DOWN to a whole 1 GiB extent
+#   5. --cap = per-disk share x number of disks in the group
+#
+# Step 3 is doing more work than it looks like. dfkv splits --cap evenly across
+# its directories (base_capacity = cap / n) and applies ONE --disk-hash-weight to
+# every disk. Both of those are only correct when the disks are the same size.
+# By handing dfkv only a same-size group, homogeneity is established before dfkv
+# sees the disks, so its uniform weight is capacity-proportional by construction
+# and nothing has to change in dfkv itself.
+#
+# Without step 3 a mixed node would be actively broken rather than merely
+# suboptimal: the small disk receives the same cap/n byte budget as the large
+# ones and fails when slab tries to lay down extents it cannot fit.
+
+- name: Select the data disks and derive the capacity
+  shell:
+    cmd: |
+      python3 - <<'PYEOF'
+      import json, os, re
+
+      ratio = {{ dfkv_disk_usage_ratio | float }}
+      min_bytes = {{ dfkv_min_disk_gb | int }} * (10 ** 9)
+      extent = {{ dfkv_slab_extent_bytes | int }}
+      tolerance = {{ dfkv_disk_group_tolerance | float }}
+
+      # data_<digits> and nothing else. A loose startswith("disk") would also
+      # match names like /mnt/disk-backup or /mnt/diskfs, and these nodes carry
+      # several enormous non-disk mounts under /mnt -- /mnt/capacity alone
+      # reports 1.6 PiB -- so the name filter is doing real work here, not tidying.
+      data_disk = re.compile(r"disk\d+$").match
+
+      found = []
+      for name in sorted(os.listdir("/mnt")):
+          if not data_disk(name):
+              continue
+          path = os.path.join("/mnt", name)
+          if not os.path.isdir(path):
+              continue
+          # ismount, not just isdir: statvfs on a plain directory reports the
+          # filesystem BEHIND it. An LV that failed to mount leaves an empty
+          # /mnt/diskN on the root filesystem, and that would measure as the
+          # root disk -- which on a node with a large root passes min_disk_gb and
+          # hands dfkv the operating system's own filesystem to fill.
+          if not os.path.ismount(path):
+              continue
+          try:
+              st = os.statvfs(path)
+          except OSError:
+              continue
+          found.append([path, st.f_blocks * st.f_frsize])
+
+      group = [d for d in found if d[1] >= min_bytes]
+      if group:
+          largest = max(d[1] for d in group)
+          group = [d for d in group if d[1] >= largest * tolerance]
+
+      skipped = [d for d in found if d not in group]
+
+      per_disk = 0
+      if group:
+          smallest = min(d[1] for d in group)
+          # Round DOWN to an extent boundary: the total is then count x per_disk,
+          # which is a whole multiple of count x extent by construction.
+          per_disk = int(smallest * ratio / extent) * extent
+
+      def gib(b):
+          return round(b / (1024.0 ** 3), 2)
+
+      print("JSON=" + json.dumps({
+          "disks": [d[0] for d in group],
+          "indices": sorted(int(os.path.basename(d[0])[4:]) for d in group),
+          "count": len(group),
+          "per_disk": per_disk,
+          "cap": per_disk * len(group),
+          "sizes": {d[0]: gib(d[1]) for d in group},
+          "skipped": ["%s (%.2f GiB)" % (d[0], gib(d[1])) for d in skipped],
+      }))
+      PYEOF
+  register: dfkv_server_disk_select
+  changed_when: false
+  # check_mode: false so that `--check` still measures the node. A dry run
+  # that skipped this would leave the derived facts undefined and fail in
+  # the next task, which is a worse answer than not supporting --check.
+  check_mode: false
+
+- name: Record the selection
+  set_fact:
+    dfkv_server_disk_selection: >-
+      {{ (dfkv_server_disk_select.stdout_lines
+          | select('match', '^JSON=')
+          | map('regex_replace', '^JSON=', '')
+          | list | first) | from_json }}
+
+- name: Fail when no disk qualifies
+  assert:
+    that:
+      - dfkv_server_disk_selection.count | int > 0
+    fail_msg: >-
+      {{ inventory_hostname }} has no data disk of at least
+      {{ dfkv_min_disk_gb }} GB under /mnt/disk*. Found:
+      {{ dfkv_server_disk_select.stdout_lines | join(' | ') }}.
+      A cache node with nowhere to cache is worse than one that is down, so this
+      fails rather than starting a server that would register into the ring and
+      serve nothing.
+
+- name: Report disks that were excluded
+  debug:
+    msg: >-
+      {{ dfkv_server_disk_selection.skipped | length }} disk(s) excluded from
+      dfkv: {{ dfkv_server_disk_selection.skipped | join(', ') }}.
+      They stay available for other tenants (dingo-cache selects its own set the
+      same way).
+  when: dfkv_server_disk_selection.skipped | length > 0
+
+- name: Record the data directories the server will be given
+  set_fact:
+    dfkv_server_disk_paths: "{{ dfkv_server_disk_selection.disks }}"
+    dfkv_server_data_dirs: >-
+      {{ dfkv_server_disk_selection.disks
+         | map('regex_replace', '$', '/' ~ dfkv_disk_subdir) | list }}
+
+- name: Settle the node capacity
+  # An explicit dfkv_cap_bytes wins; otherwise it comes from the ratio. Keeping
+  # the override is what lets a region pin one node without opting the whole
+  # region out of the ratio model.
+  set_fact:
+    dfkv_effective_cap: >-
+      {{ dfkv_cap_bytes | int if (dfkv_cap_bytes | string | length > 0)
+         else dfkv_server_disk_selection.cap | int }}
+
+- name: Fail when an explicitly pinned capacity does not divide evenly
+  assert:
+    that:
+      - >-
+        (dfkv_effective_cap | int)
+        % ((dfkv_server_data_dirs | length) * dfkv_slab_extent_bytes) == 0
+    fail_msg: >-
+      dfkv_cap_bytes={{ dfkv_effective_cap }} does not divide into
+      {{ dfkv_server_data_dirs | length }} disks as whole
+      {{ dfkv_slab_extent_bytes }}-byte extents.
+      Round it down to a multiple of
+      {{ dfkv_slab_extent_bytes * (dfkv_server_data_dirs | length) }}, or clear
+      dfkv_cap_bytes and let dfkv_disk_usage_ratio derive it.
+      This is what re-cut bj09: 10 TiB across 6 disks is 1706.67 GiB each, and
+      the server refused to start until it was 10242 GiB = 6 x 1707 GiB.
+  when: dfkv_cap_bytes | string | length > 0
+
+- name: Settle the node weight
+  # Left empty, the weight is the number of selected disks -- and with the
+  # capacity derived as a uniform fraction of each disk, that IS proportional to
+  # the node's capacity. It also happens to reproduce what the fleet already
+  # runs (6-disk nodes at 6, two-disk at 2, one-disk at 1), so turning this on
+  # does not move any keyspace on existing nodes.
+  #
+  # Set dfkv_weight explicitly to override, e.g. to hold a node back while it is
+  # being drained.
+  set_fact:
+    dfkv_effective_weight: >-
+      {{ dfkv_weight | int if (dfkv_weight | string | length > 0)
+         else (dfkv_server_disk_selection.count | int) }}
+
+- name: Report the derived capacity
+  debug:
+    msg: >-
+      {{ dfkv_server_disk_selection.count }} disk(s)
+      ({{ dfkv_server_disk_selection.sizes | dict2items
+          | map(attribute='value') | join(', ') }} GiB)
+      x {{ dfkv_disk_usage_ratio }} = {{ (dfkv_effective_cap | int / 1073741824) | round(0) }} GiB
+      total, {{ ((dfkv_effective_cap | int) // (dfkv_server_data_dirs | length) / 1073741824) | round(0) }}
+      GiB per disk

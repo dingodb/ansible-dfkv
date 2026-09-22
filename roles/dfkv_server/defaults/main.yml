@@ -1,0 +1,65 @@
+---
+# dfkv_server is the cache node. Its disk state is the only thing in dfkv that is
+# not either regenerable or in etcd, so the checks in this role gate on geometry
+# before they gate on anything else.
+
+dfkv_server_service: dfkv-server
+
+# --- Capacity: a fraction of each disk, not an absolute number ---------------
+#
+# This mirrors roles/dingo_cache in ansible-dingofs deliberately. The previous
+# model -- an absolute --cap written into region config -- had two problems that
+# only show up across a fleet rather than on one node:
+#
+#   * it does not follow the disk. Re-image a node with larger disks and the
+#     number has to be recomputed by hand, and the per-disk occupancy drifts
+#     between nodes (measured on bj09: 47.7% of the disk on six-disk nodes,
+#     85.9% on two-disk nodes).
+#   * it cannot see the other tenant on the same disks. dingo-cache claims a
+#     fraction of each disk too, and an absolute --cap has no way to be told
+#     about it.
+#
+# Expressing it as a fraction fixes the first outright and makes the second a
+# matter of two ratios that can be reasoned about together.
+dfkv_disk_usage_ratio: 0.50
+
+# Disks below this are excluded, matching dingo_cache_min_disk_gb. This is what
+# keeps a small OS or container disk from being treated as a cache disk.
+dfkv_min_disk_gb: 1000
+
+# Explicit override. Leave empty to derive the capacity from the ratio above;
+# set it only to pin a node to a specific byte count, and note that it then
+# stops tracking the disk.
+dfkv_cap_bytes: ""
+
+# Changing a running node's capacity means discarding its cache.
+#
+# Not a precaution -- a measured fact. slab refuses to open a directory laid out
+# for a different capacity:
+#
+#   ERROR: disk store startup failed: /mnt/disk2/dfkv2: existing slab layout
+#          differs from requested geometry
+#   ERROR: refusing startup: local storage initialization failed
+#
+# ...which leaves the service in a restart loop. (bj09-gpu-200b-0022,
+# 2026-09-22.) So there is no "allow the change" switch that leaves the data
+# alone: the only thing that works is removing the data, and this flag is named
+# for what it does.
+#
+# Nodes whose capacity already matches are never touched by it.
+dfkv_server_wipe_on_capacity_change: false
+
+# Slab allocates in fixed 1 GiB extents, so both the per-disk share and the node
+# total must be whole numbers of them. The selection below rounds the per-disk
+# figure DOWN to an extent boundary, which makes the total legal by construction.
+#
+# This is not hypothetical: 10 TiB across 6 disks is 1706.67 GiB each, and the
+# server refused to start. bj09 was re-cut to 10242 GiB = 6 x 1707 GiB.
+dfkv_slab_extent_bytes: 1073741824
+
+# Same-size group tolerance, matching the dingo_cache role's +/-1%. Disks outside
+# the largest same-size group are excluded rather than averaged in.
+dfkv_disk_group_tolerance: 0.99
+
+dfkv_server_ready_retries: 120
+dfkv_server_ready_delay: 2
