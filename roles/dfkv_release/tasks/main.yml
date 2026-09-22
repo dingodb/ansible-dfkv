@@ -1,0 +1,433 @@
+---
+# Stage a dfkv release onto this node, and optionally activate it.
+#
+# Two entry points, one implementation:
+#   playbooks/03_release.yml  -> staging only
+#   playbooks/10_upgrade.yml  -> staging is a no-op, then activation
+#
+# Activation = RAM gate, flip `current`, restart, wait for the new version to
+# report itself, RAM gate again. There is no separate rollback path: pointing
+# this role at the previous version is the rollback.
+
+- name: Fail early when the release version is unset
+  assert:
+    that:
+      - dfkv_version | length > 0
+      - dfkv_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+    fail_msg: >-
+      dfkv_version is '{{ dfkv_version }}', which is not an X.Y.Z release version.
+      Set it explicitly, for example -e dfkv_version=2.28.0. Available releases:
+      https://github.com/{{ dfkv_release_repo }}/releases
+  run_once: true
+
+# ---------------------------------------------------------------------------
+# Control node: obtain the tarball and establish what it should be.
+#
+# run_once + delegate_to, not a per-host `when`: a skipped run_once result has
+# no `stat` key, and referencing it from other hosts raises
+# "'dict object' has no attribute 'stat'" -- which is a confusing way to learn
+# that the download failed on one host and not others.
+# ---------------------------------------------------------------------------
+- name: Fetch the release on the control node
+  block:
+    - name: Create the control-node staging directory
+      file:
+        path: "{{ dfkv_release_stage_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Download the published checksum manifest
+      get_url:
+        url: "{{ dfkv_release_url_base }}/SHA256SUMS"
+        dest: "{{ dfkv_release_stage_dir }}/SHA256SUMS-{{ dfkv_version }}"
+        # Always refresh: a tag can be re-published during a release, and a
+        # stale manifest would validate the wrong artifact.
+        force: true
+        timeout: 60
+      environment: "{{ dfkv_release_proxy_env }}"
+      when: not (dfkv_release_use_local_tarball | bool)
+
+    - name: Extract this tarball's published checksum
+      set_fact:
+        dfkv_release_expected_sha256: >-
+          {{ ((lookup('file', dfkv_release_stage_dir ~ '/SHA256SUMS-' ~ dfkv_version)
+               .splitlines()
+               | select('search', (dfkv_release_tarball | regex_escape) ~ '$')
+               | map('split')
+               | map('first')
+               | list) + [''])[0] }}
+      when: not (dfkv_release_use_local_tarball | bool)
+
+    - name: Fail when the manifest carries no checksum for this tarball
+      assert:
+        that:
+          - dfkv_release_expected_sha256 is match('^[0-9a-f]{64}$')
+        fail_msg: >-
+          SHA256SUMS for v{{ dfkv_version }} has no entry for
+          {{ dfkv_release_tarball }}. Either the version does not exist, or the
+          release published a differently named asset. Releases:
+          https://github.com/{{ dfkv_release_repo }}/releases
+      when: not (dfkv_release_use_local_tarball | bool)
+
+    - name: Download the release tarball
+      get_url:
+        url: "{{ dfkv_release_url_base }}/{{ dfkv_release_tarball }}"
+        dest: "{{ dfkv_release_stage_dir }}/{{ dfkv_release_tarball }}"
+        # force: false keeps a cached tarball instead of re-downloading ~100 MB
+        # on every run. That would leave the cached copy unverified, so the next
+        # task checksums it; and the release's own in-tarball manifest is
+        # verified again after unpacking, on the target.
+        force: false
+        timeout: 300
+      environment: "{{ dfkv_release_proxy_env }}"
+      when: not (dfkv_release_use_local_tarball | bool)
+
+    - name: Checksum the tarball on the control node
+      stat:
+        path: "{{ dfkv_release_source_tarball }}"
+        checksum_algorithm: sha256
+      register: dfkv_release_source_stat
+
+    - name: Fail when the tarball is missing or does not match the manifest
+      assert:
+        that:
+          - dfkv_release_source_stat.stat.exists
+          - >-
+            (dfkv_release_expected_sha256 | length == 0) or
+            (dfkv_release_source_stat.stat.checksum == dfkv_release_expected_sha256)
+        fail_msg: >-
+          {{ dfkv_release_source_tarball }} is
+          {{ 'missing' if not dfkv_release_source_stat.stat.exists
+             else 'sha256 ' ~ (dfkv_release_source_stat.stat.checksum | default('?')) ~
+                  ', expected ' ~ dfkv_release_expected_sha256 }}.
+  rescue:
+    - name: Explain how to get the tarball onto the control node
+      fail:
+        msg: |
+          Could not obtain {{ dfkv_release_tarball }} on the control node.
+
+          This node has no `gh`, so the fetch is a plain HTTPS GET and it needs
+          to reach github.com. If this network only gets there through a proxy:
+
+              -e dfkv_release_proxy=http://host:port \
+              -e dfkv_release_all_proxy=socks5://host:port
+
+          Or check that the version exists:
+              {{ dfkv_release_url_base }}
+
+          Or fetch it elsewhere and hand it over, skipping the network entirely:
+              -e dfkv_release_use_local_tarball=true \
+              -e dfkv_release_local_tarball=/path/{{ dfkv_release_tarball }}
+  delegate_to: localhost
+  run_once: true
+  become: false
+
+# ---------------------------------------------------------------------------
+# Already staged?
+#
+# A release directory is immutable once written, because the launcher inside it
+# is the copy a rollback would run. Re-staging a version with a different
+# launcher therefore means the rollback target no longer matches what was
+# tested, so it fails loudly instead of quietly rewriting.
+# ---------------------------------------------------------------------------
+- name: Check whether this release is already staged
+  stat:
+    path: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}"
+  register: dfkv_release_staged
+
+- name: Read the marker of the staged release
+  slurp:
+    src: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}/.dfkv-release.json"
+  register: dfkv_release_marker
+  when: dfkv_release_staged.stat.exists
+  failed_when: false
+
+- name: Default the staged launcher checksum to "unknown"
+  set_fact:
+    dfkv_release_staged_launcher_sha256: ""
+
+- name: Read the staged release's launcher checksum
+  # A release directory with no marker, or an unreadable one, was not staged by
+  # this repo -- the fleet tooling it replaces left bare directories behind. That
+  # resolves to "unknown", which fails the assert below with the intended
+  # message instead of a JSON parse error.
+  when: dfkv_release_staged.stat.exists
+  block:
+    - name: Parse the release marker
+      set_fact:
+        dfkv_release_staged_launcher_sha256: >-
+          {{ (dfkv_release_marker.content | b64decode | from_json).launcher_sha256 | default('') }}
+  rescue:
+    - name: Treat an unreadable marker as a release this repo did not stage
+      set_fact:
+        dfkv_release_staged_launcher_sha256: ""
+
+- name: Checksum the launcher this repo would stage
+  # Not run_once: the marker comparison below is per-host, and a run_once result
+  # would only be populated on one of them.
+  stat:
+    path: "{{ role_path }}/files/{{ dfkv_release_launcher_name }}"
+    checksum_algorithm: sha256
+  delegate_to: localhost
+  become: false
+  register: dfkv_release_launcher_stat
+
+- name: Fail when a staged release was built from a different launcher
+  assert:
+    that:
+      - dfkv_release_staged_launcher_sha256 == dfkv_release_launcher_stat.stat.checksum
+    fail_msg: >-
+      {{ dfkv_deploy_root }}/releases/{{ dfkv_version }} is already staged, and
+      the launcher it carries differs from the one this repo would write. A
+      release directory is immutable because the launcher inside it is what a
+      rollback would run -- rewriting it silently would invalidate the rollback
+      target. Either bump the version, remove that directory deliberately, or
+      re-stage this one with -e dfkv_release_allow_restage=true.
+  when:
+    - dfkv_release_staged.stat.exists
+    - not (dfkv_release_allow_restage | bool)
+
+# ---------------------------------------------------------------------------
+# Stage
+# ---------------------------------------------------------------------------
+- name: Stage the release
+  when: not dfkv_release_staged.stat.exists or (dfkv_release_allow_restage | bool)
+  block:
+    - name: Push the release tarball to the node
+      copy:
+        src: "{{ dfkv_release_source_tarball }}"
+        dest: "/tmp/{{ dfkv_release_tarball }}"
+        mode: "0644"
+
+    - name: Clear any leftover unpack directory
+      file:
+        path: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}{{ dfkv_release_tmp_suffix }}"
+        state: absent
+
+    - name: Create the unpack directory
+      file:
+        path: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}{{ dfkv_release_tmp_suffix }}"
+        state: directory
+        mode: "0755"
+
+    - name: Unpack the release
+      # --strip-components=1 drops the dfkv-<ver>-linux-x86_64/ wrapper that
+      # package_release.sh puts around everything.
+      unarchive:
+        src: "/tmp/{{ dfkv_release_tarball }}"
+        dest: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}{{ dfkv_release_tmp_suffix }}"
+        remote_src: true
+        extra_opts:
+          - --strip-components=1
+
+    - name: Check whether this release carries a manifest of its own
+      # The upstream tarball does NOT ship one: the SHA256SUMS on the GitHub
+      # release is a separate asset, and checking the download against it on the
+      # control node is the only manifest check available for a freshly
+      # downloaded release. A release staged by dfkv-rollout does carry one,
+      # because its publish step adds it -- so this is conditional rather than
+      # assumed, and a hub-staged release still gets the extra verification.
+      stat:
+        path: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}{{ dfkv_release_tmp_suffix }}/SHA256SUMS"
+      register: dfkv_release_manifest
+
+    - name: Verify the release against its own manifest
+      command:
+        cmd: sha256sum -c SHA256SUMS --quiet
+        chdir: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}{{ dfkv_release_tmp_suffix }}"
+      register: dfkv_release_manifest_check
+      changed_when: false
+      when: dfkv_release_manifest.stat.exists
+
+    - name: Note that there is no in-tarball manifest to verify against
+      debug:
+        msg: >-
+          {{ dfkv_release_tarball }} carries no SHA256SUMS of its own. The
+          download was already verified against the release's published
+          SHA256SUMS asset on the control node, and the unpacked tree is
+          exercised by the flag check below, which runs the actual binary.
+      when: not dfkv_release_manifest.stat.exists
+
+    - name: Check that the staged binary supports the flags this deployment sets
+      # Done on the target, against the real binary, before the release becomes
+      # activatable. --rdma-recv-chunk-bytes is the one that has actually bitten:
+      # it arrived with DingoCache PR #359, and a deployment that sets a receive
+      # budget against an older artifact gets a server that silently ignores it.
+      shell:
+        cmd: >-
+          {{ dfkv_deploy_root }}/releases/{{ dfkv_version }}{{ dfkv_release_tmp_suffix }}/bin/dfkv_server --help 2>&1
+          | grep -q -- '{{ item }}'
+        chdir: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}{{ dfkv_release_tmp_suffix }}"
+      loop: "{{ dfkv_server_required_flags }}"
+      register: dfkv_release_flag_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail when a required flag is missing from the artifact
+      assert:
+        that:
+          - dfkv_release_flag_check.results | selectattr('rc', 'ne', 0) | list | length == 0
+        fail_msg: >-
+          v{{ dfkv_version }} does not support
+          {{ dfkv_release_flag_check.results | selectattr('rc', 'ne', 0) | map(attribute='item') | join(', ') }}.
+          This deployment depends on those flags, so activating this release
+          would start servers that ignore the settings they are given. Stage a
+          release that has them, or drop them from
+          dfkv_server_required_flags deliberately.
+
+    - name: Normalise ownership of the unpacked tree
+      # unarchive preserves the tarball's ownership, which is the CI builder's
+      # uid and does not exist on the target -- ls would show a bare "1001 1001"
+      # across a 70-node fleet. The service runs as root, so make the release
+      # root-owned like conf/ and backup/.
+      file:
+        path: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}{{ dfkv_release_tmp_suffix }}"
+        state: directory
+        owner: root
+        group: root
+        recurse: true
+
+    - name: Copy the launcher into the release
+      copy:
+        src: "{{ role_path }}/files/{{ dfkv_release_launcher_name }}"
+        dest: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}{{ dfkv_release_tmp_suffix }}/{{ dfkv_release_launcher_name }}"
+        mode: "0755"
+
+    - name: Write the release marker
+      copy:
+        # No timestamp: this content has to be a pure function of the inputs, or
+        # every run would rewrite it and report a change.
+        content: >-
+          {{ {'version': dfkv_version,
+              'launcher': dfkv_release_launcher_name,
+              'launcher_sha256': dfkv_release_launcher_stat.stat.checksum} | to_nice_json }}
+        dest: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}{{ dfkv_release_tmp_suffix }}/.dfkv-release.json"
+        mode: "0644"
+
+    - name: Move the unpacked release into place
+      # `mv .incoming <ver>` NESTS into <ver> when it already exists, which is
+      # exactly the re-stage case -- it would leave the new tree sitting at
+      # releases/<ver>/<ver>.incoming and the old one still active. So the
+      # existing tree is moved aside first.
+      #
+      # The window where releases/<ver> does not exist is one rename. A running
+      # process holds its files open and does not notice; only a restart in that
+      # instant would, and staging never restarts.
+      shell:
+        cmd: |
+          set -eu
+          cd {{ dfkv_deploy_root }}/releases
+          rm -rf '{{ dfkv_version }}.old'
+          if [ -e '{{ dfkv_version }}' ]; then mv '{{ dfkv_version }}' '{{ dfkv_version }}.old'; fi
+          mv '{{ dfkv_version }}{{ dfkv_release_tmp_suffix }}' '{{ dfkv_version }}'
+          rm -rf '{{ dfkv_version }}.old'
+      changed_when: true
+
+    - name: Remove the pushed tarball
+      file:
+        path: "/tmp/{{ dfkv_release_tarball }}"
+        state: absent
+
+    - name: Report the staged release
+      debug:
+        msg: "staged {{ dfkv_version }} at {{ dfkv_deploy_root }}/releases/{{ dfkv_version }} (inactive)"
+
+# ---------------------------------------------------------------------------
+# Activate
+# ---------------------------------------------------------------------------
+- name: Activate the release
+  when: dfkv_release_activate | bool
+  block:
+    - name: Read the RAM tier rollout gate before restarting
+      # A server with a healthy RAM tier and unwritten dirty data loses
+      # acknowledged writes when it restarts. The gate is skipped for MDS, which
+      # has no RAM tier, and passes automatically for servers that have it off.
+      uri:
+        url: "http://127.0.0.1:{{ dfkv_release_metrics_port }}/metrics"
+        return_content: true
+        status_code: [200]
+      register: dfkv_release_pre_gate
+      changed_when: false
+      failed_when: false
+      when: not (dfkv_release_is_mds | bool)
+
+    - name: Fail the rollout when the RAM tier is not quiescent
+      assert:
+        that:
+          - >-
+            (dfkv_release_pre_gate.content | default('')
+             | regex_findall('(?m)^dfkv_ram_healthy\s+(\S+)') + ['']) | first in ['', '1']
+          - >-
+            ((dfkv_release_pre_gate.content | default('')
+              | regex_findall('(?m)^dfkv_ram_post_ack_flush_failures_total\s+(\S+)') + ['0']) | first | int) == 0
+          - >-
+            ((dfkv_release_pre_gate.content | default('')
+              | regex_findall('(?m)^dfkv_ram_dirty_bytes\s+(\S+)') + ['0']) | first | int)
+            <= dfkv_ram_rollout_max_dirty_bytes
+          - >-
+            ((dfkv_release_pre_gate.content | default('')
+              | regex_findall('(?m)^dfkv_ram_oldest_dirty_age_seconds\s+(\S+)') + ['0']) | first | int)
+            <= dfkv_ram_rollout_max_dirty_age_s
+        fail_msg: >-
+          Refusing to restart: the RAM tier on {{ inventory_hostname }} still
+          holds acknowledged writes (dirty={{ (dfkv_release_pre_gate.content
+          | default('') | regex_findall('(?m)^dfkv_ram_dirty_bytes\s+(\S+)') + ['?']) | first }},
+          age={{ (dfkv_release_pre_gate.content
+          | default('') | regex_findall('(?m)^dfkv_ram_oldest_dirty_age_seconds\s+(\S+)') + ['?']) | first }}s).
+          Wait for the flush to catch up and re-run. A missing dfkv_ram_healthy
+          metric means the RAM tier is off, which passes this gate.
+      when: not (dfkv_release_is_mds | bool)
+
+    - name: Point current at the new release
+      file:
+        src: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}"
+        dest: "{{ dfkv_deploy_root }}/current"
+        state: link
+        force: true
+      register: dfkv_release_flip
+
+    - name: Restart the service
+      systemd:
+        name: "{{ dfkv_release_service }}"
+        state: restarted
+        daemon_reload: true
+
+    - name: Wait for the service to report the new version
+      # The version comes from the process's own metrics endpoint, not from the
+      # symlink. The symlink is a statement of intent; this is the only thing
+      # that proves the new binary is the one actually serving.
+      uri:
+        url: "http://127.0.0.1:{{ dfkv_release_metrics_port }}/metrics"
+        return_content: true
+        status_code: [200]
+      register: dfkv_release_post_ready
+      until: >-
+        ('version="' ~ dfkv_version ~ '"') in (dfkv_release_post_ready.content | default(''))
+      retries: "{{ dfkv_release_ready_retries }}"
+      delay: "{{ dfkv_release_ready_delay }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Fail when the service did not come up on the new version
+      assert:
+        that:
+          - >-
+            ('version="' ~ dfkv_version ~ '"') in (dfkv_release_post_ready.content | default(''))
+        fail_msg: >-
+          {{ dfkv_release_service }} on {{ inventory_hostname }} did not report
+          version {{ dfkv_version }} within
+          {{ dfkv_release_ready_retries | int * dfkv_release_ready_delay | int }}s.
+          `current` now points at the new release; check `systemctl status
+          {{ dfkv_release_service }}` and `journalctl -u {{ dfkv_release_service }}`.
+          To go back, run this playbook again with the previous version.
+
+    - name: Confirm the RAM tier recovered
+      assert:
+        that:
+          - >-
+            (dfkv_release_post_ready.content | default('')
+             | regex_findall('(?m)^dfkv_ram_healthy\s+(\S+)') + ['']) | first in ['', '1']
+        fail_msg: >-
+          The RAM tier on {{ inventory_hostname }} did not come back healthy
+          after restart.
+      when: not (dfkv_release_is_mds | bool)

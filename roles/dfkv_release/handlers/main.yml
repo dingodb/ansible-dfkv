@@ -1,0 +1,4 @@
+---
+# No handlers. Activation is not a reaction to a file changing -- it is either
+# requested (10_upgrade.yml) or it is not, and doing it implicitly on a template
+# change would restart serving nodes as a side effect of an unrelated edit.
