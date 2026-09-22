@@ -1,0 +1,141 @@
+---
+# System preparation. Idempotent: packages and directories only.
+
+- name: Check that the current effective user is root
+  assert:
+    that:
+      - ansible_effective_user_id == 0
+    fail_msg: >-
+      This role must be executed as root.
+      Current user is '{{ ansible_user_id }}' (uid={{ ansible_effective_user_id }}).
+      dfkv creates no service account; binaries, data directories and systemd
+      units are all root-owned.
+    success_msg: "Running as root - OK"
+
+- name: Install the RDMA and base packages
+  package:
+    name: "{{ dfkv_prepare_packages_debian if ansible_os_family == 'Debian'
+              else dfkv_prepare_packages_redhat }}"
+    state: present
+
+- name: Create the deployment directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ dfkv_prepare_directories }}"
+
+- name: List RDMA devices
+  # lstat rather than a glob in a shell: an absent /sys/class/infiniband is a
+  # normal state on a node with no HCA, not an error to be worked around.
+  ansible.builtin.find:
+    paths: /sys/class/infiniband
+    file_type: any
+  register: dfkv_prepare_ib_devices
+  failed_when: false
+
+- name: Report the RDMA device inventory
+  debug:
+    msg: >-
+      {{ 'no RDMA devices present' if dfkv_prepare_ib_devices.matched | default(0) == 0
+         else ('RDMA devices: ' ~ (dfkv_prepare_ib_devices.files | map(attribute='path') | map('basename') | list | join(', '))) }}
+
+- name: Fail when a node is expected to have RDMA but does not
+  assert:
+    that:
+      - dfkv_prepare_ib_devices.matched | default(0) > 0
+    fail_msg: >-
+      {{ inventory_hostname }} has no RDMA devices under /sys/class/infiniband,
+      but this node is in cache_servers and dfkv_server is configured with
+      --rdma-port. Either install the HCA drivers, or move this node out of
+      cache_servers deliberately.
+  when:
+    - inventory_hostname in (groups['cache_servers'] | default([]))
+    - dfkv_rdma_dev | default('') | length > 0
+
+- name: Record the RDMA devices this node actually has
+  set_fact:
+    dfkv_prepare_ib_names: >-
+      {{ dfkv_prepare_ib_devices.files | default([])
+         | map(attribute='path') | map('basename') | list }}
+
+- name: Fail when the RDMA whitelist names a device this node does not have
+  # Not hypothetical: a region's default list is written for its main node type,
+  # and a node of a different generation can carry fewer rails. Naming a device
+  # that is not there narrows the usable rails without saying so -- the flags
+  # look right, the ring comes up, and the node just moves less data than its
+  # peers. (Measured on bj09: the 200b nodes have ib7s400p0-7, the 300x node has
+  # only ib7s400p0-3.)
+  assert:
+    that:
+      - item in dfkv_prepare_ib_names
+    fail_msg: >-
+      dfkv_rdma_dev names '{{ item }}', which does not exist on
+      {{ inventory_hostname }}.
+      Devices present: {{ dfkv_prepare_ib_names | join(', ') }}.
+      Set dfkv_rdma_dev for this node to the rails it actually has, rather than
+      inheriting a region default written for different hardware.
+  loop: "{{ dfkv_rdma_dev | default('') | split(',') | select | list }}"
+  # A value containing a shell glob is a pattern, not a literal list -- it is
+  # expanded against this node's devices by dfkv_server. Validating it as
+  # literals here would fail on every node the pattern is meant to adapt to.
+  when:
+    - dfkv_rdma_dev | default('') | length > 0
+    - not ('*' in dfkv_rdma_dev or '?' in dfkv_rdma_dev or '[' in dfkv_rdma_dev)
+
+- name: Look for mounted data disks
+  # Checked here, not only in dfkv_server, so a node that cannot hold cache
+  # fails at phase 0 rather than after the release has already been pushed to
+  # it. Only real mount points count -- see select_disks.yml for why.
+  shell:
+    cmd: |
+      python3 - <<'PYEOF'
+      import os, re
+      data_disk = re.compile(r"disk\d+$").match
+      for name in sorted(os.listdir("/mnt")):
+          if not data_disk(name):
+              continue
+          path = os.path.join("/mnt", name)
+          if os.path.isdir(path) and os.path.ismount(path):
+              print(path)
+      PYEOF
+  register: dfkv_prepare_mounts
+  changed_when: false
+  check_mode: false
+
+- name: Fail when a cache node has no mounted data disk
+  assert:
+    that:
+      - dfkv_prepare_mounts.stdout_lines | length > 0
+    fail_msg: >-
+      {{ inventory_hostname }} has no mounted /mnt/disk* filesystem.
+
+      dfkv_server needs a data disk to hold cache, and this role deliberately
+      does not create one: the LVs, filesystems and mount points are provisioned
+      by the lvm_cache role in ansible-dingofs (playbooks/cache_02_lvm.yml),
+      which is what the disk selection here mirrors. Run that first, or confirm
+      the disks are actually mounted -- an unmounted /mnt/diskN left as a plain
+      directory does not count.
+  when: inventory_hostname in (groups['cache_servers'] | default([]))
+
+- name: Check whether nvidia-peermem is loaded
+  command:
+    cmd: lsmod
+  register: dfkv_prepare_lsmod
+  changed_when: false
+  failed_when: false
+  when:
+    - dfkv_prepare_check_peermem | bool
+    - inventory_hostname in (groups['cache_servers'] | default([]))
+
+- name: Warn when GPUDirect support is missing
+  debug:
+    msg: >-
+      nvidia-peermem is not loaded. GPUDirect RDMA needs it: without it
+      ibv_reg_mr cannot register a CUDA buffer and GPU-to-cache transfers
+      fail or fall back. Load it with `modprobe nvidia-peermem` and make it
+      persistent if this node is meant to serve GPU workloads.
+  when:
+    - dfkv_prepare_lsmod is defined
+    - dfkv_prepare_lsmod.stdout is defined
+    - "'nvidia_peermem' not in dfkv_prepare_lsmod.stdout"
