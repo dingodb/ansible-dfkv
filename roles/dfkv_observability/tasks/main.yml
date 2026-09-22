@@ -1,0 +1,196 @@
+---
+# Deploy the per-region telemetry stack. Independent of the daemons: it neither
+# needs them running nor disturbs them.
+
+- name: Skip when telemetry is disabled for this region
+  meta: end_host
+  when: not (dfkv_observability_enabled | bool)
+
+- name: Check whether the release is staged on this node
+  # stat, NOT `is directory`: Jinja's file tests resolve against the CONTROL
+  # node's filesystem, not the target's.
+  stat:
+    path: >-
+      {{ dfkv_deploy_root }}/releases/{{ dfkv_version }}/{{ dfkv_observability_assets }}
+  register: dfkv_observability_release_stat
+
+- name: Fail early when the release is not staged
+  assert:
+    that:
+      - dfkv_observability_release_stat.stat.isdir | default(false)
+    fail_msg: >-
+      {{ dfkv_deploy_root }}/releases/{{ dfkv_version }}/{{ dfkv_observability_assets }}
+      is not staged on {{ inventory_hostname }}. Run playbooks/03_release.yml
+      first. The stack renders from the observability assets inside the release,
+      so its dashboards and alert rules always match the deployed binaries.
+
+- name: Detect the container runtime
+  shell:
+    cmd: |
+      if command -v docker >/dev/null 2>&1; then printf 'docker'
+      elif command -v podman >/dev/null 2>&1; then printf 'podman'
+      else printf 'none'
+      fi
+  register: dfkv_observability_runtime_detect
+  changed_when: false
+
+- name: Fail when no container runtime is available
+  assert:
+    that:
+      - dfkv_observability_runtime_detect.stdout != 'none'
+    fail_msg: >-
+      Neither docker nor podman is installed on {{ inventory_hostname }}.
+
+- name: Record the runtime and its compose invocation
+  set_fact:
+    dfkv_observability_runtime_name: >-
+      {{ dfkv_observability_runtime if dfkv_observability_runtime | length > 0
+         else dfkv_observability_runtime_detect.stdout }}
+    dfkv_observability_compose_cmd: >-
+      {{ (dfkv_observability_runtime if dfkv_observability_runtime | length > 0
+          else dfkv_observability_runtime_detect.stdout) ~ ' compose' }}
+
+# ---------------------------------------------------------------------------
+# The Grafana admin password.
+#
+# The secret file is the source of truth, and it is read rather than rotated:
+# the render always uses whatever is on disk, so a deploy can never silently
+# recreate Grafana with a different password and lock out every existing
+# session. Rotating it is a separate, explicit act that also has to rotate the
+# Grafana database.
+# ---------------------------------------------------------------------------
+- name: Create the secret directory
+  file:
+    path: "{{ dfkv_observability_secret_file | dirname }}"
+    state: directory
+    mode: "0700"
+
+- name: Read the Grafana admin password
+  slurp:
+    src: "{{ dfkv_observability_secret_file }}"
+  register: dfkv_observability_secret
+  failed_when: false
+
+- name: Fail when the secret path is a symlink
+  assert:
+    that:
+      - not (dfkv_observability_secret.stat.islnk | default(false))
+    fail_msg: >-
+      {{ dfkv_observability_secret_file }} is a symlink. The Grafana admin
+      password must live in a plain root-only file.
+
+- name: Generate a Grafana admin password
+  set_fact:
+    dfkv_observability_grafana_password: >-
+      {{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}
+  when: dfkv_observability_secret.content is not defined
+
+- name: Use the existing Grafana admin password
+  set_fact:
+    dfkv_observability_grafana_password: "{{ dfkv_observability_secret.content | b64decode | trim }}"
+  when: dfkv_observability_secret.content is defined
+
+- name: Write the Grafana admin password
+  copy:
+    content: "{{ dfkv_observability_grafana_password }}\n"
+    dest: "{{ dfkv_observability_secret_file }}"
+    mode: "0600"
+  when: dfkv_observability_secret.content is not defined
+
+# ---------------------------------------------------------------------------
+# Render the bundle.
+#
+# Content-addressed and immutable: the directory name carries a hash of the
+# render inputs, so the same inputs reuse it and different inputs produce a new
+# one. The running stack is never edited in place, which is what makes an
+# accidental re-deploy a no-op instead of an outage.
+# ---------------------------------------------------------------------------
+- name: Create the bundle directory
+  file:
+    path: "{{ dfkv_observability_root }}/releases/{{ dfkv_observability_release_name }}"
+    state: directory
+    mode: "0755"
+
+- name: Copy the release's observability assets into the bundle
+  copy:
+    src: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}/{{ dfkv_observability_assets }}/"
+    dest: "{{ dfkv_observability_root }}/releases/{{ dfkv_observability_release_name }}/"
+    remote_src: true
+    mode: preserve
+
+- name: Render the Prometheus configuration
+  template:
+    src: prometheus.yml.j2
+    dest: "{{ dfkv_observability_root }}/releases/{{ dfkv_observability_release_name }}/prometheus.yml"
+    mode: "0644"
+
+- name: Render the compose override
+  template:
+    src: compose-override.yml.j2
+    dest: "{{ dfkv_observability_root }}/releases/{{ dfkv_observability_release_name }}/compose.override.yml"
+    mode: "0644"
+
+- name: Render the environment file
+  # 0600: it carries the Grafana admin password.
+  template:
+    src: env.j2
+    dest: "{{ dfkv_observability_root }}/releases/{{ dfkv_observability_release_name }}/.env"
+    mode: "0600"
+
+- name: Point current at this revision
+  # Tracked so a re-run that produced an identical revision reports no change
+  # rather than flipping a symlink to the same target.
+  file:
+    src: "{{ dfkv_observability_root }}/releases/{{ dfkv_observability_release_name }}"
+    dest: "{{ dfkv_observability_root }}/current"
+    state: link
+    force: true
+  register: dfkv_observability_link
+
+- name: Bring the stack up
+  # `up -d` reconciles: containers already running on this revision are left
+  # alone. This is why re-deploying identical inputs is a no-op.
+  command:
+    cmd: >-
+      {{ dfkv_observability_compose_cmd }}
+      -f {{ dfkv_observability_compose_file }}
+      -f compose.override.yml
+      --project-name {{ dfkv_observability_project }}
+      up -d --remove-orphans
+    chdir: "{{ dfkv_observability_root }}/current"
+  register: dfkv_observability_up
+  changed_when: >-
+    'Started' in dfkv_observability_up.stdout or 'Created' in dfkv_observability_up.stdout
+
+- name: Wait for the collector health endpoint
+  uri:
+    url: "http://127.0.0.1:{{ dfkv_observability_collector_health_port }}/"
+    status_code: [200]
+  register: dfkv_observability_health
+  until: dfkv_observability_health.status | default(0) == 200
+  retries: "{{ dfkv_observability_health_retries }}"
+  delay: "{{ dfkv_observability_health_delay }}"
+  changed_when: false
+  # Skipped in check mode: `compose up` did not run, so nothing is listening and
+  # the poll would spin for the full retry budget waiting for a stack the dry run
+  # deliberately did not start.
+  when: not ansible_check_mode
+
+- name: Wait for Prometheus to report ready
+  uri:
+    url: "http://127.0.0.1:{{ dfkv_observability_prometheus_port }}/-/ready"
+    status_code: [200]
+  register: dfkv_observability_prom_ready
+  until: dfkv_observability_prom_ready.status | default(0) == 200
+  retries: "{{ dfkv_observability_health_retries }}"
+  delay: "{{ dfkv_observability_health_delay }}"
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Report the stack
+  debug:
+    msg: >-
+      telemetry stack {{ dfkv_observability_release_name }} running via
+      {{ dfkv_observability_runtime_name }}; OTLP http on
+      {{ dfkv_observability_bind_host }}:{{ dfkv_observability_otlp_http_port }},
+      Grafana on {{ dfkv_observability_grafana_bind_host }}:{{ dfkv_observability_grafana_port }}

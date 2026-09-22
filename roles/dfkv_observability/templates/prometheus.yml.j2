@@ -1,0 +1,53 @@
+{# Managed by Ansible.
+
+   Scrape targets are the *declared* node set, not the live ring. A node that
+   has fallen out of the ring -- hardware failure, a bad upgrade, one that was
+   removed from the inventory but never disabled -- must stay visible in
+   monitoring precisely when it disappears from the ring. Deriving targets from
+   the ring would erase the outage along with the evidence. #}
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  external_labels:
+    cluster_type: dfkv
+    dfkv_dc: {{ dfkv_cluster_name }}
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8888"]
+
+  - job_name: dfkv-connectors
+    honor_labels: true
+    static_configs:
+      - targets: ["otel-collector:8889"]
+
+  - job_name: dfkv_server
+    static_configs:
+      - targets:
+{% for host in groups['cache_servers'] | default([]) %}
+          - "{{ hostvars[host].ansible_host }}:{{ hostvars[host].dfkv_server_metrics_port | default(dfkv_server_metrics_port) }}"
+{% endfor %}
+        labels:
+          dfkv_dc: {{ dfkv_cluster_name }}
+
+  - job_name: dfkv_mds
+    static_configs:
+      - targets:
+{% for host in groups['mds_servers'] | default([]) %}
+          - "{{ hostvars[host].ansible_host }}:{{ hostvars[host].dfkv_mds_metrics_port | default(dfkv_mds_metrics_port) }}"
+{% endfor %}
+        labels:
+          dfkv_dc: {{ dfkv_cluster_name }}
+{% if dfkv_observability_remote_write_urls | length > 0 %}
+
+# Cross-region fan-out. Each region keeps its own stack; these are additional
+# destinations, not a replacement for local retention.
+remote_write:
+{% for url in dfkv_observability_remote_write_urls %}
+  - url: {{ url }}
+{% endfor %}
+{% endif %}

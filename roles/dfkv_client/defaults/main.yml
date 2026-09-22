@@ -1,0 +1,33 @@
+---
+# Publish the client tree to the shared filesystem.
+#
+# Two invariants, both learned the hard way:
+#
+#   1. Versioned, never a `current` symlink. A symlink flip on a
+#      lazily-consistent network filesystem (DingoFS, GPFS) resolves differently
+#      on different nodes for a window of seconds. Engines in one ring that load
+#      different builds derive different cache identities and quietly miss each
+#      other -- a correctness problem, not a performance one. Pod specs pin
+#      release/<ver>/ explicitly.
+#
+#   2. Publishing is not activation. Cutting a ring over to a new version is a
+#      coordinated restart of every engine instance in that ring, inside one
+#      window, owned by whoever owns those workloads. This role only puts the
+#      artifacts in place.
+
+dfkv_client_dir: ""
+dfkv_client_stage_dir: ""
+
+# Refuse to overwrite an existing published build with different bytes. A
+# silent overwrite would mean two nodes resolving the same path to different
+# artifacts, which is exactly the state the versioned layout exists to prevent.
+dfkv_client_force: false
+
+dfkv_client_rdma_depth: 4
+dfkv_client_rdma_connection_min_block_bytes: 262144
+
+dfkv_client_required_paths:
+  - lib/libdfkv.so
+  - bin/dfkvctl
+  - python
+  - integration
