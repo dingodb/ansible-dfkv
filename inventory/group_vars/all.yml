@@ -1,0 +1,276 @@
+---
+# dfkv defaults.
+#
+# This file is the template a region's group_vars/all.yml is copied from, not a
+# file that loads alongside it. When you run
+#
+#   ansible-playbook -i <env>/<region>/hosts.py ...
+#
+# Ansible loads group_vars only from the *inventory source directory* and from
+# the playbook directory -- never from this repo's inventory/. So the region copy
+# must be self-contained: everything below that a region changes has to be
+# present there too, at its region value.
+#
+# Values here are the safe, deletable defaults. Nothing in this file carries a
+# production address, device name or node list.
+
+# ==== User & Access ====
+# dfkv creates no service account: binaries, data directories and systemd units
+# are all root-owned, exactly as in the rollout this replaces.
+dfkv_user: root
+ansible_python_interpreter: /usr/bin/python3
+
+# ==== Layout ====
+# dfkv_root is the deployment root on cache nodes; dfkv_mds_root is the MDS/etcd
+# root, which is allowed to differ (bj09: MDS at /root/dfkv, servers at
+# /root/dfkv2). Both are version-independent: releases live underneath.
+dfkv_root: /root/dfkv
+dfkv_mds_root: "{{ dfkv_root }}"
+dfkv_etcd_root: "{{ dfkv_mds_root }}"
+
+dfkv_server_service: dfkv-server
+dfkv_mds_service: dfkv-mds
+dfkv_etcd_service: dfkv-etcd
+
+# The root a given node deploys *this* release into. Derived from group
+# membership rather than from the hostname: a node is an MDS because the
+# inventory says so. The rollout inferred this from `*-cpu-*` in the name and
+# restarted the wrong service on bj11, whose MDS nodes are `bj11-dingofs-00NN`.
+# A host that is somehow in both groups resolves to the MDS root.
+dfkv_deploy_root: >-
+  {{ dfkv_mds_root if inventory_hostname in (groups['mds_servers'] | default([]))
+     else dfkv_root }}
+
+# Subdirectory inside each data disk. Deliberately NOT version-stamped: the slab
+# on-disk format is a function of --slab-granularity, not of the release, and a
+# stable path is what lets a restarted node reattach its existing cache.
+dfkv_disk_subdir: dfkv2
+
+# ==== Release ====
+# The control node has no `gh`. Releases are fetched over HTTPS, and
+# dfkv_release_proxy is handed to get_url so the fetch works from a network that
+# only reaches github.com through a proxy. Leave empty to go direct.
+dfkv_release_proxy: "{{ lookup('env', 'https_proxy') }}"
+
+dfkv_version: ""                       # e.g. "2.28.0" -- no leading v
+dfkv_release_repo: dingodb/DingoCache
+
+# GitHub is normally only reachable through a mirror from these networks, so the
+# fetch goes through one by default. A gh-proxy style mirror takes the full
+# upstream URL as a path and needs nothing more than a prefix:
+#
+#   https://gh-proxy.com/https://github.com/<owner>/<repo>/releases/download/...
+#
+# Leave empty to go straight to github.com (which needs outbound access or
+# dfkv_release_proxy below).
+dfkv_release_mirror: ""
+
+dfkv_release_url_base: "{{ dfkv_release_mirror }}https://github.com/{{ dfkv_release_repo }}/releases/download/v{{ dfkv_version }}"
+dfkv_release_tarball: "dfkv-{{ dfkv_version }}-linux-x86_64.tar.gz"
+
+# Control-node scratch space for the downloaded tarball; the role pushes from
+# here to every target, so a 70-node region downloads once, not 70 times.
+dfkv_release_stage_dir: /root/dfkv-release
+
+# Air-gapped control nodes, or a tarball already fetched by hand: point this at
+# a local file and the download is skipped entirely.
+dfkv_release_local_tarball: ""
+dfkv_release_use_local_tarball: false
+
+# Stage-once semantics. A release directory is immutable after staging because
+# the launcher script is snapshotted into it -- that snapshot is what makes a
+# rollback safe (see roles/dfkv_server/files/dfkv_server_start.sh). Re-staging
+# the same version with a changed launcher therefore fails loudly; this flag is
+# the deliberate override.
+dfkv_release_allow_restage: false
+
+# ==== etcd ====
+# Pinned independently of the dfkv release: etcd is a third-party prerequisite
+# that ships in neither the tarball nor this repo.
+dfkv_etcd_version: v3.5.17
+dfkv_etcd_download_url: "https://mirrors.huaweicloud.com/etcd/{{ dfkv_etcd_version }}/etcd-{{ dfkv_etcd_version }}-linux-amd64.tar.gz"
+dfkv_etcd_client_port: 23790
+dfkv_etcd_peer_port: 23791
+dfkv_etcd_cluster_token: "dfkv-{{ dfkv_cluster_name | default('default') }}"
+
+# 8 GiB backend quota + periodic compaction. Not optional: client registration and
+# lease keepalives rewrite keys continuously, so the revision counter climbs even
+# though the key count is stable. At etcd's 2 GiB default this ends in
+# ALARM NOSPACE -- etcd goes read-only, `dfkvctl ring` reports members=0, and
+# dfkv_server processes stay up and healthy while the cluster has silently
+# fallen out of the ring.
+dfkv_etcd_quota_bytes: 8589934592
+dfkv_etcd_auto_compaction_retention: 1h
+
+# ==== MDS ====
+dfkv_mds_listen_port: 28250
+dfkv_mds_metrics_port: 28260
+
+# dfkv_mds appends the scheme itself, so a "http://" here produces
+# "http://http://..." and every etcd call fails. Keep it host:port.
+dfkv_mds_etcd: "127.0.0.1:{{ dfkv_etcd_client_port }}"
+
+# Opt-in shim that relaxes the wire epoch by one generation during a migration.
+# Must be removed once `dfkv_mds_legacy_frames_total` stops moving; leaving it
+# on forever silently keeps old clients alive.
+#
+# bj09 has it ON on the ground (2026-09-22), and the switch is not visible from
+# anywhere except the unit's Environment line -- an Ansible-managed region would
+# turn it off by default. Check `systemctl cat dfkv-mds` against this value
+# before adopting an existing cluster.
+dfkv_mds_accept_legacy: false
+
+# Endpoint list handed to servers and to dfkvctl. Derived from the mds_servers
+# group, so it needs BOTH inventory sources on the command line -- the region's
+# hosts.py (cache nodes) and hosts-mds.yml (MDS nodes). A run that supplies only
+# hosts.py renders this empty and every server fails its first registration.
+dfkv_mds_endpoints: >-
+  {{ groups['mds_servers'] | default([])
+     | map('extract', hostvars, 'ansible_host')
+     | map('regex_replace', '$', ':' ~ (dfkv_mds_listen_port | string))
+     | join(',') }}
+
+# ==== Server ====
+dfkv_cluster_name: default
+dfkv_group: prod-v2
+
+# Ports are PER REGION, not a global convention. The two regions checked on the
+# ground (2026-09-22) disagree:
+#
+#   bj09: cache 28200/28201/28210, MDS 28150/28160
+#   bj11: cache 28200/28201/28210, MDS 28250/28260
+#
+# So a region must state its own MDS ports explicitly rather than inheriting
+# these. Getting it wrong fails loudly (the MDS listens nowhere the servers
+# were told to look), which is the good case.
+dfkv_server_port: 28200
+dfkv_server_rdma_port: 28201
+dfkv_server_metrics_port: 28210
+dfkv_server_metrics_bind: 0.0.0.0
+
+# First-MDS-registration deadline. On expiry the server drops its listener and
+# exits 1 on purpose, which is why the unit needs Restart=on-failure.
+dfkv_mds_registration_timeout_ms: 60000
+
+# --- Capacity ---------------------------------------------------------------
+# A fraction of each disk, not an absolute number, matching how dingo-cache
+# sizes itself. Cache nodes run both systems on the same NVMes, so expressing
+# dfkv the same way is what makes the two add up on paper instead of colliding
+# at runtime.
+#
+# The disk's own measured size drives this: the role picks the largest group of
+# same-size disks, takes the smallest of that group, and uses
+# `floor(size x ratio / 1 GiB) x 1 GiB` per disk. Rounding down to an extent
+# keeps the total a whole multiple of disk-count x 1 GiB, which is what slab
+# requires.
+#
+# Budget check, measured 2026-09-22: dingo-cache is configured at 0.80 of each
+# disk. At dfkv 0.50 the two add up to 1.30 of the disk, which is fine precisely
+# because dingo-cache grows on demand and evicts -- it simply settles below its
+# own ceiling instead of failing. What it cannot do is grow into space dfkv has
+# already taken, so dfkv's 50% is the number that really has to be right.
+dfkv_disk_usage_ratio: 0.50
+
+# Disks smaller than this are excluded from the selection, matching
+# dingo_cache_min_disk_gb. Keeps OS or container disks out of the cache set.
+dfkv_min_disk_gb: 1000
+
+# Explicit override, normally left empty. Setting it pins the node to a byte
+# count and opts it out of the ratio model -- which also means the number stops
+# following the disk and has to be re-derived by hand when disks change.
+dfkv_cap_bytes: ""
+
+# --- Per-node values a region sets as host variables on cache_servers --------
+# Empty = derive from the number of selected data disks. Under the ratio
+# model that is exactly proportional to node capacity, so it is the right
+# value on every node type without being written down anywhere. A literal
+# number pins the node, which is what you want when draining one.
+dfkv_weight: ""
+dfkv_advertise_iface: ""               # interface whose IPv4 becomes --advertise
+dfkv_rdma_dev: ""
+dfkv_ram_tier: false
+dfkv_ram_tier_bytes: 17179869184       # 16 GiB
+
+# Storage and transport knobs. These are centre-wide, not per-node.
+dfkv_store_engine: slab
+dfkv_slab_write: direct
+dfkv_disk_hash_weight: 10
+# Upstream default is 0 (off). Both regions checked on the ground run 1, so a
+# migrated region almost certainly wants 1 too -- leaving it at 0 would silently
+# turn off read coalescing that production has been relying on.
+dfkv_read_coalesce: 0
+dfkv_rdma_depth: 4
+dfkv_rdma_recv_segment_size: 68719476736    # 64 GiB hard budget
+dfkv_rdma_recv_chunk_bytes: 268435456       # 256 MiB lazy commit granularity
+dfkv_rdma_recv_chunk_idle_ms: 60000
+dfkv_max_msg: 67108864                      # 64 MiB
+dfkv_slab_evict_high_pct: 92
+dfkv_slab_evict_low_pct: 88
+dfkv_slab_evict_max_extents_per_tick: 1
+
+# Rolling-upgrade gate. A server about to restart must first show a healthy RAM
+# tier with little dirty data, or the restart loses acknowledged writes. Absent
+# metrics mean the RAM tier is off, which passes.
+dfkv_ram_rollout_max_dirty_bytes: 67108864
+dfkv_ram_rollout_max_dirty_age_s: 5
+
+# ==== Observability ====
+# The stack runs on one node per region (normally an MDS). It scrapes every
+# server and MDS by pull, and connectors push to it over OTLP; nothing is sent
+# across regions.
+dfkv_observability_enabled: true
+dfkv_observability_root: /root/dfkv-observability
+dfkv_observability_otlp_grpc_port: 14317
+dfkv_observability_otlp_http_port: 14318
+dfkv_observability_collector_health_port: 23133
+dfkv_observability_collector_prom_port: 18889
+dfkv_observability_prometheus_port: 19090
+dfkv_observability_tempo_port: 13200
+dfkv_observability_grafana_port: 13100
+
+# Only OTLP binds the cluster-reachable address, because connectors push to it.
+# Everything else stays on loopback unless a region says otherwise.
+dfkv_observability_bind_host: 127.0.0.1
+dfkv_observability_grafana_bind_host: 127.0.0.1
+
+# Root-only file holding the Grafana admin password. The password is never in
+# group_vars, never on a command line and never inside the versioned bundle.
+dfkv_observability_secret_file: "{{ dfkv_observability_root }}/secret/grafana-admin-password"
+
+dfkv_observability_retention_time: 15d
+dfkv_observability_retention_size: 100GB
+dfkv_observability_tempo_block_retention: 72h
+dfkv_observability_remote_write_urls: []
+
+# ==== Client ====
+# Client artifacts go on the shared filesystem for inference Pods to load. They
+# are versioned and never reachable through a `current` symlink: a symlink flip
+# on a lazily-consistent network filesystem has a cross-node window in which
+# instances in one ring load different builds.
+dfkv_client_dir: ""
+dfkv_client_stage_dir: ""
+dfkv_client_force: false
+
+dfkv_client_rdma_depth: 4
+dfkv_client_rdma_connection_min_block_bytes: 262144
+
+# ==== Performance Tuning ====
+# The RAM arena, RDMA memory regions and CUDA pinned buffers all need to be
+# locked, and slab's direct mode holds two file descriptors per extent -- roughly
+# 10k on a 5 TiB node.
+dfkv_limit_memlock: infinity
+dfkv_limit_nofile: 1048576
+dfkv_tune_swappiness: 10
+dfkv_tune_max_map_count: 655360
+
+# Slab startup pre-touches the RAM arena and registers MRs over it at roughly
+# 5-10s per 16 GiB. A >=64 GiB arena therefore needs a start timeout well above
+# systemd's 90s default.
+dfkv_service_timeout_start_sec: 600
+dfkv_service_timeout_stop_sec: 600
+
+# ==== Verification ====
+# A ring reports ram= as a fixed arena truth: the budget minus the two oversized
+# extents reserved on each side, rounded down to the 4 KiB page.
+dfkv_verify_ram_reserve_bytes: 67108864
+dfkv_verify_expected_members: 0        # 0 = derive from the rings this region defines
