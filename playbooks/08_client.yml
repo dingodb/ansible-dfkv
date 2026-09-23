@@ -18,6 +18,10 @@
 # those workloads -- and it must happen inside one window, for the same reason.
 #
 #   ansible-playbook -i <inv> playbooks/08_client.yml
+#
+# This playbook assumes the release is already staged on the client_stage host.
+# For a first publish, or on a node that has never been prepared, use
+# 01_prepare.yml and 02_release.yml first -- they run the prepare and stage steps.
 - name: Publish the dfkv client tree
   hosts: client_stage
   remote_user: root

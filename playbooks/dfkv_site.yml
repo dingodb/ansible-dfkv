@@ -1,33 +1,39 @@
 ---
 # Master playbook: full greenfield bring-up of a dfkv cluster.
 #
+# Every playbook here is numbered for the order it runs in, so `ls playbooks/`
+# reads as the deploy sequence. 00-08 are the bring-up chain, 90-91 are lifecycle
+# actions (upgrade, uninstall), 99 is read-only. 08_client is the one that sits
+# outside the chain: it publishes client artifacts to a shared filesystem and is
+# not part of bringing a region up.
+#
 # This is the ordering the fleet tooling encoded as `deploy`, and it is the only
-# place in this repo where the phases are sequenced. Every phase below is also a
-# standalone playbook -- run it directly to re-apply just that phase.
+# place in this repo where the steps are sequenced. Every step below is also a
+# standalone playbook -- run it directly to re-apply just that one.
 #
 # ============================================================
 # Why this order
 # ============================================================
-#   0 prepare     : packages, directories, RDMA provider check.
-#   1 release     : fetch once on the control node, push to every target.
-#                   Nothing is running yet; nothing can be disrupted.
-#   2 etcd        : the only authoritative state in the system. Must be healthy
-#                   before any MDS starts, because an MDS that cannot reach etcd
-#                   exits rather than degrading.
-#   3 mds         : must be up before any server, because a server's first
-#                   registration has a hard 60s deadline and it exits 1 on
-#                   expiry. Servers do not queue waiting for the MDS.
-#   4 server      : the ring itself. Cluster mode engages here.
-#   5 verify      : assert against the ring, not against the inventory.
-#   6 observability: last. Servers do not need it, and bringing it up after the
-#                   ring means its first scrape sees a fully-formed cluster
-#                   instead of filling the dashboards with startup noise.
+#   01 prepare      : packages, directories, RDMA provider check.
+#   02 release      : fetch once on the control node, push to every target.
+#                     Nothing is running yet; nothing can be disrupted.
+#   03 etcd         : the only authoritative state in the system. Must be healthy
+#                     before any MDS starts, because an MDS that cannot reach
+#                     etcd exits rather than degrading.
+#   04 mds          : must be up before any server, because a server's first
+#                     registration has a hard 60s deadline and it exits 1 on
+#                     expiry. Servers do not queue waiting for the MDS.
+#   05 server       : the ring itself. Cluster mode engages here.
+#   06 verify       : assert against the ring, not against the inventory.
+#   07 observability: last. Servers do not need it, and bringing it up after the
+#                     ring means its first scrape sees a fully-formed cluster
+#                     instead of filling the dashboards with startup noise.
 #
-# There is deliberately no host-tuning phase between prepare and release. The
-# obvious candidate for one -- jemalloc, hugepages, sysctl, cpupower -- does not
-# apply here, and the settings that do matter are per-service rather than
-# per-host, so they live in the units under roles/dfkv_server and roles/dfkv_etcd
-# where they travel with the service they belong to:
+# There is deliberately no host-tuning playbook. The obvious candidate --
+# jemalloc, hugepages, sysctl, cpupower -- does not apply, and the settings that
+# do matter are per-service rather than per-host, so they live in the units under
+# roles/dfkv_server and roles/dfkv_etcd where they travel with the service they
+# belong to:
 #
 #   * LimitMEMLOCK=infinity  -- the RAM arena, RDMA memory regions and CUDA
 #     pinned buffers are all locked pages.
@@ -42,20 +48,20 @@
 # locked pages are not reclaimable, so swapping cannot touch it.
 #
 # ============================================================
-# Re-running: what happens on the second run, phase by phase
+# Re-running: what happens on the second run, step by step
 # ============================================================
-#   0 prepare     : no-op (packages and directories).
-#   1 release     : no-op. The release directory is immutable; re-staging the
-#                   same version with a changed launcher fails rather than
-#                   silently rewriting a directory a rollback depends on.
-#   2 etcd        : REFUSES TO RUN if etcd is already active. Re-bootstrapping a
-#                   live quorum destroys the member set.
-#   3 mds         : rewrites env/unit only if their content changed; restarts
-#                   only on change.
-#   4 server      : same. A converged server is not restarted, so its RAM arena
-#                   and open connections survive a re-run.
-#   5 verify      : read-only.
-#   6 observability: content-addressed bundle; same inputs means no restart.
+#   01 prepare      : no-op (packages and directories).
+#   02 release      : no-op. The release directory is immutable; re-staging the
+#                     same version with a changed launcher fails rather than
+#                     silently rewriting a directory a rollback depends on.
+#   03 etcd         : REFUSES TO RUN if etcd is already active. Re-bootstrapping
+#                     a live quorum destroys the member set.
+#   04 mds          : rewrites env/unit only if their content changed; restarts
+#                     only on change.
+#   05 server       : same. A converged server is not restarted, so its RAM arena
+#                     and open connections survive a re-run.
+#   06 verify       : read-only.
+#   07 observability: content-addressed bundle; same inputs means no restart.
 #
 # ============================================================
 # Preflight
@@ -68,23 +74,23 @@
 - name: "Preflight: region inventory is complete"
   import_playbook: 00_check_config.yml
 
-- name: "Phase 0: System preparation"
+- name: "01 prepare: system preparation"
   import_playbook: 01_prepare.yml
 
-- name: "Phase 1: Stage the release"
-  import_playbook: 03_release.yml
+- name: "02 release: stage the release"
+  import_playbook: 02_release.yml
 
-- name: "Phase 2: etcd quorum"
-  import_playbook: 04_etcd.yml
+- name: "03 etcd: bootstrap the quorum"
+  import_playbook: 03_etcd.yml
 
-- name: "Phase 3: dfkv_mds"
-  import_playbook: 05_mds.yml
+- name: "04 mds: deploy the control plane"
+  import_playbook: 04_mds.yml
 
-- name: "Phase 4: dfkv_server"
-  import_playbook: 06_server.yml
+- name: "05 server: deploy the cache ring"
+  import_playbook: 05_server.yml
 
-- name: "Phase 5: Verify"
-  import_playbook: 09_verify.yml
+- name: "06 verify: assert against the ring"
+  import_playbook: 06_verify.yml
 
-- name: "Phase 6: Telemetry stack"
+- name: "07 observability: telemetry stack"
   import_playbook: 07_observability.yml

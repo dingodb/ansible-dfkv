@@ -17,7 +17,7 @@
       - dfkv_mds_release_stat.stat.isdir | default(false)
     fail_msg: >-
       {{ dfkv_mds_root }}/releases/{{ dfkv_version }} is not staged on
-      {{ inventory_hostname }}. Run playbooks/03_release.yml first.
+      {{ inventory_hostname }}. Run playbooks/02_release.yml first.
 
 - name: Check whether this repo staged that release
   stat:
@@ -47,11 +47,11 @@
 
       Re-stage it so both halves come from this repo, then re-run this playbook:
 
-          ansible-playbook -i <inv> playbooks/03_release.yml \
+          ansible-playbook -i <inv> playbooks/02_release.yml \
             -e dfkv_version={{ dfkv_version }} \
             -e dfkv_release_allow_restage=true
 
-      playbooks/dfkv_site.yml does this for you, because it runs 03_release first.
+      playbooks/dfkv_site.yml does this for you, because it runs 02_release first.
 
 - name: Fail early when the etcd endpoint carries a scheme
   # dfkv_mds prefixes the scheme itself, so "http://host:port" becomes
@@ -73,8 +73,8 @@
   register: dfkv_mds_current_link
 
 - name: Fail when current points at a different release
-  # Repointing an existing link is an ACTIVATION, not a deploy. 03_release.yml
-  # deliberately only stages, and 10_upgrade.yml owns the flip. Doing it here
+  # Repointing an existing link is an ACTIVATION, not a deploy. 02_release.yml
+  # deliberately only stages, and 90_upgrade.yml owns the flip. Doing it here
   # would mean a reconverge run silently moved a node between versions.
   assert:
     that:
@@ -84,12 +84,12 @@
       {{ dfkv_mds_root }}/current points at
       {{ dfkv_mds_current_link.stat.lnk_target | default('?') }}, not releases/{{ dfkv_version }}.
       Repointing it is an activation: run
-      playbooks/10_upgrade.yml -e dfkv_version={{ dfkv_version }} instead.
+      playbooks/90_upgrade.yml -e dfkv_version={{ dfkv_version }} instead.
   when: dfkv_mds_current_link.stat.exists
 
 - name: Point current at this release on a first deploy
   # A node that has never had dfkv installed has no `current` at all, and
-  # nothing else creates one -- 03_release.yml only stages. Without this the
+  # nothing else creates one -- 02_release.yml only stages. Without this the
   # unit would exec a path that does not exist and fail with status=203/EXEC,
   # which reads like a broken binary rather than a missing symlink.
   file:

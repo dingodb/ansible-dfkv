@@ -19,8 +19,8 @@
 # Staging is always safe to run ahead of an upgrade window -- it never restarts
 # anything and never touches `current`.
 #
-#   ansible-playbook -i <inv> playbooks/03_release.yml
-#   ansible-playbook -i <inv> playbooks/03_release.yml --limit dfkv-cache-1
+#   ansible-playbook -i <inv> playbooks/02_release.yml
+#   ansible-playbook -i <inv> playbooks/02_release.yml --limit dfkv-cache-1
 - name: Stage the dfkv release
   hosts: "{{ target_hosts | default('mds_servers:cache_servers') }}"
   remote_user: root

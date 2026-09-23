@@ -1,0 +1,34 @@
+---
+# Playbook: Install and start the etcd quorum (greenfield).
+#
+# NOT serial. The members bootstrap with --initial-cluster-state new and a fixed
+# --initial-cluster, which is the documented way to form a quorum: each member
+# knows the full member list and they elect once a majority is reachable.
+#
+# Serial would deadlock. The unit is Type=notify and etcd only signals READY
+# once it has a leader, so the first member of a three node quorum cannot become
+# ready on its own -- `systemctl start` blocks until the default 90s
+# TimeoutStartSec and the play fails with "a timeout was exceeded". All the
+# members have to be starting at once.
+#
+# Greenfield only: the role refuses to touch an etcd that is already active, so
+# this cannot be misused as a "re-bootstrap" against a running cluster.
+#
+#   ansible-playbook -i <inv> playbooks/03_etcd.yml
+
+- name: Gather facts from every etcd member
+  # Every member's --initial-cluster is built from ALL members' OS hostnames, and
+  # with serial:1 below only the current batch is in the play -- so the first
+  # member reads ansible_hostname on the others and gets "'HostVarsVars object'
+  # has no attribute 'ansible_hostname'". Gathering once, up front, puts every
+  # member's facts in hostvars for the rest of the run.
+  hosts: etcd_servers
+  gather_facts: true
+  tasks: []
+
+- name: Bootstrap the etcd quorum
+  hosts: etcd_servers
+  remote_user: root
+  become: false
+  roles:
+    - dfkv_etcd

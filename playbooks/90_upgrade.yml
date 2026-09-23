@@ -3,8 +3,8 @@
 #
 # Stage first -- this playbook activates, it does not fetch:
 #
-#   ansible-playbook -i <inv> playbooks/03_release.yml
-#   ansible-playbook -i <inv> playbooks/10_upgrade.yml
+#   ansible-playbook -i <inv> playbooks/02_release.yml
+#   ansible-playbook -i <inv> playbooks/90_upgrade.yml
 #
 # Activation per node is: RAM gate -> flip the `current` symlink -> restart ->
 # poll the metrics endpoint until it reports the target version -> RAM gate
@@ -18,8 +18,8 @@
 # batches. Measured on xn01: 47 nodes at batch=4 with 32 live clients, zero
 # disconnects. Override with -e dfkv_upgrade_batch=N.
 #
-#   ansible-playbook -i <inv> playbooks/10_upgrade.yml -e dfkv_upgrade_batch=4
-#   ansible-playbook -i <inv> playbooks/10_upgrade.yml --limit dfkv-cache-1
+#   ansible-playbook -i <inv> playbooks/90_upgrade.yml -e dfkv_upgrade_batch=4
+#   ansible-playbook -i <inv> playbooks/90_upgrade.yml --limit dfkv-cache-1
 
 # MDS first. dfkv_mds serves the topology RPC, and an older MDS does not
 # recognise kListTopology -- a modern server polling it fails the call and keeps
@@ -28,6 +28,10 @@
 # NOTE: the fleet tooling this replaces rolled servers first and only then called
 # upgrade-mds, apparently by accident of how its subcommands were ordered rather
 # than by intent. This playbook follows the upstream deployment guide instead.
+#
+# dfkv_release_activate_roles keeps that ordering meaningful where the two groups
+# overlap: a region may run both roles on one machine, and without it the MDS play
+# would take that node's server down and the server play would restart it again.
 - name: Roll dfkv_mds forward
   hosts: mds_servers
   remote_user: root
@@ -36,6 +40,7 @@
   gather_facts: false
   vars:
     dfkv_release_activate: true
+    dfkv_release_activate_roles: [mds]
   roles:
     - dfkv_release
 
@@ -47,5 +52,6 @@
   gather_facts: false
   vars:
     dfkv_release_activate: true
+    dfkv_release_activate_roles: [server]
   roles:
     - dfkv_release
