@@ -1,6 +1,40 @@
 ---
 # Install and start one etcd member. Greenfield only -- see the guard below.
 
+- name: Check the size of the quorum this region is building
+  # dfkv_mds takes ONE etcd endpoint -- `--etcd <host:port>`, verified in
+  # src/mds/dfkv_mds_main.cc, which does args.Get("--etcd", "127.0.0.1:2379")
+  # with no list parsing. So a replica talks to exactly one etcd and cannot fail
+  # over, and the usual deployment points each MDS at its own node's etcd.
+  #
+  # That is fine at three: losing a node costs one etcd member and one MDS
+  # replica, leaving two of each, and the servers hold all three endpoints so
+  # they move on. It is not fine below three, and it is worst at two -- two
+  # members tolerate no failure at all while costing two machines, where one
+  # member at least makes the single point obvious.
+  #
+  # This cannot be fixed in the roles: a single endpoint is what the binary
+  # accepts. So say it out loud at deploy time instead.
+  run_once: true
+  block:
+    - name: Count the etcd members this region declares
+      set_fact:
+        dfkv_etcd_member_count: "{{ groups['etcd_servers'] | default([]) | length }}"
+
+    - name: Warn when the quorum cannot tolerate a failure
+      debug:
+        msg: >-
+          WARNING: this region declares {{ dfkv_etcd_member_count }} etcd
+          member(s). etcd needs a majority of members alive to accept writes, so
+          {{ dfkv_etcd_member_count }} member(s) cannot lose any at all and the
+          ring freezes at the last good view when one goes.
+          {{ 'One member is an outright single point.' if dfkv_etcd_member_count | int == 1
+             else 'Two is the worst of both -- no tolerance and two machines.' }}
+          Three is the smallest size that survives losing a node.
+          This is not something the roles can fix: dfkv_mds takes a single
+          --etcd endpoint and cannot fail over. See inventory/hosts.yml.
+      when: dfkv_etcd_member_count | int < 3
+
 - name: Check that the current effective user is root
   assert:
     that:
