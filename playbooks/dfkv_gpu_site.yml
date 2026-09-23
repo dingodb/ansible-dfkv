@@ -1,0 +1,53 @@
+---
+# Master playbook: bring up a batch of cache nodes -- the GPU machines.
+#
+# One command where the chain needs three, and the counterpart of dfkv_site.yml.
+# That one composes imported playbooks because its phases each run against a
+# different group (etcd_servers, then mds_servers, then cache_servers). A cache
+# node's three phases all run against the same host set, so they are three roles
+# in one play instead.
+#
+#   ansible-playbook -i <inv> playbooks/dfkv_gpu_site.yml -e dfkv_version=2.28.0
+#   ansible-playbook -i <inv> playbooks/dfkv_gpu_site.yml -e dfkv_version=2.28.0 --check
+#
+# The machines: the GPU nodes, which are also the region's `cache_servers` --
+# the same group name ansible-dingofs uses, because it is the same host set.
+# Measured 2026-09-23, bj09's and bj11's GPU nodes run dingo-cache and
+# dfkv_server side by side over the same NVMes, so the two systems share the
+# group and have to share the disks (see dfkv_disk_usage_ratio).
+#
+# dfkv_server is not dfkv's client. The client is the library inside the
+# inference process; it is published to a shared filesystem rather than deployed
+# to a node, which is what 08_client.yml does.
+#
+# The three phases, in the order each depends on the previous:
+#
+#   dfkv_prepare : packages (the RDMA userspace providers are load-bearing -- a
+#                  missing one gives an empty device list, not an error),
+#                  directories, and the RDMA device probe.
+#   dfkv_release : fetch the release once on the control node, stage it here.
+#                  Stage only; activation belongs to 90_upgrade.yml.
+#   dfkv_server  : data directories, capacity from the disks this node actually
+#                  has, env, unit, start, wait for /readyz.
+#
+# Idempotent throughout. A converged node is not restarted -- the env and unit
+# templates notify a handler only when their contents change -- so its RAM arena
+# and open connections survive a re-run.
+#
+# The MDS must already be up: a server's first registration has a hard 60s
+# deadline and it exits 1 on expiry rather than queueing. On a region being built
+# from scratch that means dfkv_site.yml, or at least 03_etcd + 04_mds, first.
+#
+# serial defaults to all at once, which is right for a first deploy where
+# nothing is serving yet. A run that changes capacity discards each node's cache,
+# so pass -e dfkv_server_serial=1 for that -- and note the gate on it:
+# dfkv_server_wipe_on_capacity_change.
+- name: Deploy dfkv cache nodes
+  hosts: "{{ target_hosts | default('cache_servers') }}"
+  remote_user: root
+  become: false
+  serial: "{{ dfkv_server_serial | default('100%') }}"
+  roles:
+    - dfkv_prepare
+    - dfkv_release
+    - dfkv_server

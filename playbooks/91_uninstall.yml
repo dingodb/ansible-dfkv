@@ -1,0 +1,291 @@
+---
+# Playbook: Remove dfkv from a region's nodes.
+#
+# The only destructive playbook here, so it has two gates and both are
+# deliberate.
+#
+#   ansible-playbook -i <inv> playbooks/91_uninstall.yml \
+#     -e dfkv_uninstall_confirm=true
+#   ansible-playbook -i <inv> playbooks/91_uninstall.yml \
+#     -e dfkv_uninstall_confirm=true -e dfkv_uninstall_scope=mds
+#
+# The components form a chain -- a cache node registers with the MDS, and the
+# MDS reads and writes etcd -- so a layer cannot be removed while the layer
+# above it stays: what is left would be running against something that is not
+# there. Removing the MDS while cache nodes are registered leaves those nodes
+# unable to re-register after their next restart, and removing etcd while an MDS
+# is configured against it leaves an MDS that cannot reach its only
+# authoritative store.
+#
+# So the scopes are the suffixes of that chain:
+#
+#   server  remove dfkv-server .................. keep MDS and etcd
+#   mds     remove dfkv-server and dfkv-mds ..... keep etcd
+#   etcd    remove all three ................... the default
+#
+# The narrower scopes stop and unwire the services and leave the release tree on
+# disk, because that tree is shared: its releases/ is what the MDS still running
+# off `current` is executing. Only the full scope removes it, along with
+# etcd-data, the telemetry stack and the control node's download cache.
+#
+# What every scope leaves: the packages 01_prepare installed (rdma-core, jq).
+# Removing them is more risk than it is worth, and a reinstall puts them back.
+#
+# Gate 1: -e dfkv_uninstall_confirm=true. Without it, nothing is touched.
+#
+# Gate 2: no cache node may still be registered. "Are the clients offline" is not
+# a question dfkv can answer -- a connector talks to dfkv_server and never checks
+# in with the MDS, so there is no client list to read. The registration count is
+# the reliable proxy, and a sound one: clients can only be served by a registered
+# server, so an empty ring means nothing is being served. Every scope removes the
+# servers, so this gate always applies.
+
+- name: Refuse unless the teardown is confirmed
+  # hosts: all + connection: local + run_once, so the gate runs whatever the
+  # inventory looks like and whatever --limit says. A gate that can be skipped by
+  # naming the wrong hosts is not a gate.
+  hosts: all
+  connection: local
+  gather_facts: false
+  run_once: true
+  vars:
+    dfkv_uninstall_confirm: false
+    dfkv_uninstall_scope: etcd
+    dfkv_uninstall_scope_layers:
+      server: [server]
+      mds: [server, mds]
+      etcd: [server, mds, etcd]
+  tasks:
+    - name: Fail when the scope is not one of the three suffixes
+      assert:
+        that:
+          - dfkv_uninstall_scope in dfkv_uninstall_scope_layers
+        fail_msg: >-
+          dfkv_uninstall_scope is '{{ dfkv_uninstall_scope }}'. It names the
+          deepest layer to remove, and the components form a chain, so only the
+          suffixes are valid: server, mds, etcd.
+
+    - name: Fail unless the teardown was confirmed on the command line
+      assert:
+        that:
+          - dfkv_uninstall_confirm | bool
+        fail_msg: |
+          scope={{ dfkv_uninstall_scope }} removes
+          {{ dfkv_uninstall_scope_layers[dfkv_uninstall_scope] | join(', ') }}
+          from every node in the region:
+
+            · the units, stopped, disabled and deleted
+            · their conf/*.env, where the layer is being removed
+          {% if dfkv_uninstall_scope == 'etcd' %}
+            · {{ dfkv_deploy_root }} -- releases, conf, launchers, backup
+            · {{ dfkv_deploy_root }}/etcd-data -- the only authoritative state
+              dfkv has
+            · the telemetry stack, and the control node's release download cache
+          {% else %}
+            · NOT the release tree: scope={{ dfkv_uninstall_scope }} keeps
+              {{ 'etcd' if dfkv_uninstall_scope == 'mds' else 'the MDS and etcd' }},
+              which is executing out of it
+          {% endif %}
+
+          etcd is not backed up anywhere. Losing it means every cache node has to
+          re-register, and nothing recovers what the MDS held. A reinstall gives
+          you a fresh cluster, not this one back.
+
+          Re-run with:
+
+              -e dfkv_uninstall_confirm=true -e dfkv_uninstall_scope={{ dfkv_uninstall_scope }}
+
+- name: Refuse while any cache node is still registered
+  hosts: admin
+  gather_facts: false
+  run_once: true
+  vars:
+    # Read from etcd, not from `dfkvctl ring`: etcd is where registration
+    # actually happens, and dfkvctl exits non-zero on an empty ring, which is a
+    # correct answer that is easy to mistake for a failed read.
+    dfkv_uninstall_etcd_host: "{{ groups['etcd_servers'] | default([]) | first | default('') }}"
+  tasks:
+    - name: Count the registered cache nodes
+      command:
+        argv:
+          - "{{ dfkv_etcd_root }}/etcdctl"
+          - "--endpoints=http://{{ hostvars[dfkv_uninstall_etcd_host]['ansible_host'] }}:{{ dfkv_etcd_client_port }}"
+          - get
+          - "/dfkv/v1/groups/{{ dfkv_group }}/members/"
+          - --prefix
+          - --count-only
+          - --write-out=fields
+      delegate_to: "{{ dfkv_uninstall_etcd_host }}"
+      register: dfkv_uninstall_regs
+      changed_when: false
+      failed_when: false
+      when: dfkv_uninstall_etcd_host | length > 0
+
+    - name: Fail when a cache node is still registered
+      assert:
+        that:
+          - >-
+            ((dfkv_uninstall_regs.stdout | default('')
+              | regex_findall('"Count"\s*:\s*([0-9]+)') | first | default('0') | int) == 0)
+        fail_msg: >-
+          etcd still holds
+          {{ dfkv_uninstall_regs.stdout | default('') | regex_findall('"Count"\s*:\s*([0-9]+)') | first | default('?') }}
+          registration(s) for group {{ dfkv_group }}. Take those cache nodes down
+          first -- a registered server is one a client may still be talking to,
+          and tearing the control plane out from under it drops every connection
+          mid-flight.
+      when: dfkv_uninstall_etcd_host | length > 0
+
+    - name: Note that the registration count could not be read
+      # Deliberately not a failure. The gate exists to protect a *working*
+      # control plane; one that cannot be read is not serving anyone, and
+      # refusing here would block the teardown in exactly the case that needs it
+      # most. The confirm gate has already covered "I mean to destroy this".
+      debug:
+        msg: >-
+          etcd could not be read ({{ dfkv_uninstall_regs.msg | default('no etcd
+          host in the inventory') }}), so the registration count is unknown.
+          Proceeding: a control plane that cannot be read is not serving anyone,
+          and the teardown was confirmed explicitly.
+      when: >-
+        (dfkv_uninstall_etcd_host | length == 0)
+        or (dfkv_uninstall_regs.rc | default(1) != 0)
+
+- name: Stop and remove the dfkv units in scope
+  hosts: "{{ target_hosts | default('all') }}"
+  become: false
+  vars:
+    dfkv_uninstall_scope: etcd
+    dfkv_uninstall_scope_layers:
+      server: [server]
+      mds: [server, mds]
+      etcd: [server, mds, etcd]
+    dfkv_uninstall_wanted: "{{ dfkv_uninstall_scope_layers[dfkv_uninstall_scope] }}"
+    # Per node, in reverse install order: cache node, then MDS, then etcd. etcd
+    # goes last because it is what the other two talk to -- stopping it first
+    # only fills the journal of services that are about to be stopped anyway.
+    #
+    # `env` is the full path, spelled out per layer. The MDS and server launchers
+    # both find their file through the unit's Environment=DFKV_CONF_DIR, so both
+    # live in <root>/conf/ -- a region that suffixed its unit names (bj11 runs
+    # dfkv-mds-v2) still reads the unsuffixed file, so these names are fixed and
+    # do not follow the service name.
+    #
+    # etcd has no environment file: the role used to write one, but nothing read
+    # it -- the unit bakes its ports into ExecStart and the MDS takes its etcd
+    # endpoint from dfkv-mds.env. Empty here so the removal task skips it.
+    dfkv_uninstall_units: >-
+      {{ ([{'svc': dfkv_server_service, 'env': dfkv_root ~ '/conf/dfkv-server.env'}]
+          if ('server' in dfkv_uninstall_wanted
+              and inventory_hostname in (groups['cache_servers'] | default([]))) else [])
+         + ([{'svc': dfkv_mds_service, 'env': dfkv_mds_root ~ '/conf/dfkv-mds.env'}]
+            if ('mds' in dfkv_uninstall_wanted
+                and inventory_hostname in (groups['mds_servers'] | default([]))) else [])
+         + ([{'svc': dfkv_etcd_service, 'env': ''}]
+            if ('etcd' in dfkv_uninstall_wanted
+                and inventory_hostname in (groups['etcd_servers'] | default([]))) else []) }}
+  tasks:
+    - name: Stop and disable the units
+      systemd:
+        name: "{{ item.svc }}"
+        state: stopped
+        enabled: false
+      loop: "{{ dfkv_uninstall_units }}"
+      loop_control:
+        label: "{{ item.svc }}"
+      # A unit that is not installed is a normal answer on a half-installed or
+      # already-torn-down node, not a failure.
+      failed_when: false
+
+    - name: Remove the unit files
+      file:
+        path: "/etc/systemd/system/{{ item.svc }}.service"
+        state: absent
+      loop: "{{ dfkv_uninstall_units }}"
+      loop_control:
+        label: "{{ item.svc }}"
+
+    - name: Remove this layer's environment file
+      file:
+        path: "{{ item.env }}"
+        state: absent
+      loop: "{{ dfkv_uninstall_units }}"
+      loop_control:
+        label: "{{ item.env }}"
+      when: item.env | length > 0
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: true
+
+- name: Remove the release tree, for the full scope only
+  # The tree is shared -- releases/ is what a still-running MDS executes out of
+  # `current`, and etcd-data lives underneath it -- so a narrower scope must not
+  # touch it. That is what makes `mds` a legitimate "keep etcd" scope.
+  hosts: "{{ target_hosts | default('all') }}"
+  become: false
+  vars:
+    dfkv_uninstall_scope: etcd
+  tasks:
+    - name: Remove the release tree
+      when: dfkv_uninstall_scope == 'etcd'
+      block:
+        - name: Check for a telemetry stack
+          stat:
+            path: "{{ dfkv_observability_root }}/current"
+          register: dfkv_uninstall_observability
+
+        - name: Bring the telemetry stack down
+          # Before the directory is removed, so compose is still there to read.
+          # failed_when: false -- a stack that is already down, or a node without
+          # a compose provider, must not block the teardown of everything else.
+          command:
+            cmd: >-
+              podman compose -f docker-compose.yml -f compose.override.yml
+              --project-name {{ dfkv_observability_project | default('dfkv-observability') }}
+              down
+            chdir: "{{ dfkv_observability_root }}/current"
+          when: dfkv_uninstall_observability.stat.exists
+          changed_when: false
+          failed_when: false
+
+        - name: Remove the telemetry stack
+          file:
+            path: "{{ dfkv_observability_root }}"
+            state: absent
+          when: dfkv_uninstall_observability.stat.exists
+
+        - name: Remove the dfkv deployment root
+          # Takes etcd-data with it. That is the point of this scope, and the
+          # thing the confirm message says out loud.
+          file:
+            path: "{{ dfkv_deploy_root }}"
+            state: absent
+
+        - name: Remove any leftover etcd scratch files
+          # 03_etcd cleans these up itself on success; a run that failed part-way
+          # leaves them behind.
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /tmp/etcd-unpack
+            - "/tmp/etcd-{{ dfkv_etcd_version }}-linux-amd64.tar.gz"
+
+- name: Remove the control node's staging directory
+  hosts: admin
+  gather_facts: false
+  run_once: true
+  vars:
+    dfkv_uninstall_scope: etcd
+  tasks:
+    - name: Remove the release staging directory
+      # On the control node, and the only thing here that is not on a target.
+      # Cached so a re-run of 02_release does not re-download ~100 MB; removed so
+      # a reinstall actually goes through the network path it would in a new
+      # region, which is the point of tearing down and starting over.
+      file:
+        path: "{{ dfkv_release_stage_dir }}"
+        state: absent
+      delegate_to: localhost
+      when: dfkv_uninstall_scope == 'etcd'
