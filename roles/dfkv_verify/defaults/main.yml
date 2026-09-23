@@ -16,10 +16,26 @@
 dfkv_verify_groups:
   - "{{ dfkv_group }}"
 
-# Groups the region declares, for the membership expectation. Defaults to the
-# number of cache nodes in the inventory; a region using per-host group
-# overrides sets this explicitly.
-dfkv_verify_expected_members: 0
+# Whether this region runs any cache nodes at all.
+#
+# A region with none -- control plane only, which is what a region without GPU
+# nodes gets -- has no ring to assert against, and an empty ring is then the
+# correct answer rather than a failure. The control-plane assertions below cover
+# everything such a region actually runs.
+#
+# Derived from the group rather than from a configured count on purpose. The
+# role compares the ring against etcd (both live), never against the inventory: a
+# region may legitimately declare more cache nodes than are online, which is what
+# bj11 does with 70 declared and 52 in the ring.
+dfkv_verify_has_ring: "{{ (groups['cache_servers'] | default([]) | length) > 0 }}"
+
+# Every (host, unit) pair that has to come back on its own after a reboot.
+# Built from the groups rather than listed, so a region that adds cache nodes
+# gets the server units checked without editing this.
+dfkv_verify_units: >-
+  {{ (groups['etcd_servers'] | default([]) | product([dfkv_etcd_service]) | list)
+     + (groups['mds_servers'] | default([]) | product([dfkv_mds_service]) | list)
+     + (groups['cache_servers'] | default([]) | product([dfkv_server_service]) | list) }}
 
 # Server -> MDS registration lives in etcd under this prefix.
 dfkv_verify_etcd_prefix: /dfkv/v1/groups

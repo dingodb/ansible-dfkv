@@ -188,6 +188,14 @@
         dest: "/tmp/etcd-{{ dfkv_etcd_version }}-linux-amd64.tar.gz"
         mode: "0644"
 
+    - name: Create the scratch directory
+      # unarchive requires dest to exist. Nothing else creates it, and the task
+      # at the end of this block removes it again, so every install needs it.
+      file:
+        path: /tmp/etcd-unpack
+        state: directory
+        mode: "0755"
+
     - name: Unpack etcd to a scratch directory
       unarchive:
         src: "/tmp/etcd-{{ dfkv_etcd_version }}-linux-amd64.tar.gz"
@@ -230,17 +238,6 @@
     dest: "/etc/systemd/system/{{ dfkv_etcd_service }}.service"
     mode: "0644"
   notify: Restart dfkv-etcd
-
-- name: Deploy the etcd environment file
-  copy:
-    # The node's own client/MDS wiring lives here rather than in the unit, so a
-    # region can point its MDS at a different port without editing a unit.
-    content: |
-      # Managed by Ansible.
-      ETCD_CLIENT_PORT={{ dfkv_etcd_client_port }}
-      ETCD_PEER_PORT={{ dfkv_etcd_peer_port }}
-    dest: "{{ dfkv_etcd_root }}/etcd.env"
-    mode: "0644"
 
 - name: Check whether firewalld is running
   command:

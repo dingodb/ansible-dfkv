@@ -26,6 +26,20 @@ dfkv_observability_compose_file: docker-compose.yml
 # Container runtime. Auto-detected; override to pin one.
 dfkv_observability_runtime: ""
 
+# The compose provider. `podman compose` is only a shim that execs an external
+# provider, and a node with neither podman-compose nor the docker compose plugin
+# fails with "looking up compose provider failed" -- which names the shim, not the
+# missing package. bj09's stack got its copy from the fleet tooling; a node
+# provisioned by Ansible alone has none.
+#
+# Both families package it under the same name today; the lists are separate
+# because that is a distro decision, same shape as dfkv_prepare_packages_*.
+dfkv_observability_install_compose_provider: true
+dfkv_observability_compose_provider_packages_debian:
+  - podman-compose
+dfkv_observability_compose_provider_packages_redhat:
+  - podman-compose
+
 # Everything that changes what gets rendered. The bundle directory is named
 # after a hash of this, so identical inputs reuse a revision instead of
 # restarting a healthy stack -- and a changed input produces a new revision

@@ -53,6 +53,11 @@
   loop: "{{ dfkv_verify_ring.results }}"
   loop_control:
     label: "{{ item.item }}"
+  # Skipped where the region declares no cache nodes. dfkvctl exits 1 with
+  # "has no registered cache nodes" on an empty ring, and for such a region that
+  # is the correct answer rather than a failed read -- the control-plane
+  # assertions at the end of this role cover what is actually running there.
+  when: dfkv_verify_has_ring | bool
 
 - name: Count the members the ring reports
   # `ver=` appears once per member line, so counting it counts members. There is
@@ -96,6 +101,9 @@
       The ring for group {{ item.group }} reports no members. Every server in
       this group is either down, unregistered, or pointed at a different group.
   loop: "{{ dfkv_verify_counts }}"
+  # Skipped where the region declares no cache nodes: there is no ring to be
+  # empty, and the control-plane assertions below are the whole check.
+  when: dfkv_verify_has_ring | bool
 
 - name: Fail when a ring member is not running the target version
   # The real inspection criterion. This is the check that catches a node left
@@ -157,6 +165,9 @@
       - "{{ dfkv_verify_etcd_prefix }}/{{ item }}/members/"
       - --prefix
       - --count-only
+      # Required: etcd 3.5 rejects --count-only without it ("--count-only is only
+      # for `--write-out=fields`").
+      - --write-out=fields
   loop: "{{ dfkv_verify_groups }}"
   register: dfkv_verify_etcd
   changed_when: false
@@ -177,12 +188,19 @@
     label: "{{ item.item }}"
 
 - name: Compare the ring against etcd
+  # The count is read by field name, not as the first number in the output.
+  # --write-out=fields prints ClusterID, MemberID, Revision, RaftTerm, More and
+  # Count in that order, so `regex_findall('[0-9]+') | first` would return the
+  # ClusterID -- a value that does not change between runs, and would therefore
+  # compare equal to itself no matter how far the ring and etcd had drifted.
   assert:
     that:
-      - (item.1.stdout | regex_findall('[0-9]+') | first | int) == item.0.total
+      - >-
+        (item.1.stdout | regex_findall('"Count"\s*:\s*([0-9]+)') | first | int)
+        == item.0.total
     fail_msg: >-
       group {{ item.0.group }}: etcd holds
-      {{ item.1.stdout | regex_findall('[0-9]+') | first | default('?') }}
+      {{ item.1.stdout | regex_findall('"Count"\s*:\s*([0-9]+)') | first | default('?') }}
       registrations but the ring reports {{ item.0.total }} members. The MDS
       view and the registered member set disagree -- check for an etcd NOSPACE
       alarm (`etcdctl alarm list`, `etcdctl endpoint status`) before restarting
@@ -191,8 +209,103 @@
   loop_control:
     label: "{{ item.0.group }}"
 
+# ---------------------------------------------------------------------------
+# Control plane.
+#
+# Asserted in every region, not only the ones without cache nodes. An empty ring
+# has two very different causes -- every server being down, or no server
+# belonging there in the first place -- and neither a quorum that has lost its
+# majority nor an MDS that cannot reach etcd is visible from the ring alone.
+# ---------------------------------------------------------------------------
+- name: Check every etcd member is healthy
+  command:
+    argv:
+      - "{{ dfkv_etcd_root }}/etcdctl"
+      - "--endpoints=http://{{ hostvars[item]['ansible_host'] }}:{{ dfkv_etcd_client_port }}"
+      - endpoint
+      - health
+  loop: "{{ groups['etcd_servers'] | default([]) }}"
+  register: dfkv_verify_etcd_health
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ groups['etcd_servers'][0] }}"
+
+- name: Fail when an etcd member is unhealthy
+  assert:
+    that:
+      - item.rc == 0
+    fail_msg: >-
+      etcd member {{ item.item }} is not healthy.
+      {{ item.stderr | default('') | trim }}
+      {{ item.stdout | default('') | trim }}
+      A quorum that has lost its majority keeps answering reads while refusing
+      writes, which is why this is asserted rather than inferred from the MDS
+      being up.
+  loop: "{{ dfkv_verify_etcd_health.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Check every MDS replica is ready
+  # /readyz, not /healthz: it is the debounced etcd probe, so an MDS that cannot
+  # reach etcd fails here while its process stays healthy.
+  uri:
+    url: "http://{{ hostvars[item]['ansible_host'] }}:{{ dfkv_mds_metrics_port }}/readyz"
+    status_code: [200]
+  loop: "{{ groups['mds_servers'] | default([]) }}"
+  register: dfkv_verify_mds_ready
+  changed_when: false
+  failed_when: false
+
+- name: Fail when an MDS replica is not ready
+  assert:
+    that:
+      - item.status | default(0) == 200
+    fail_msg: >-
+      MDS replica {{ item.item }} is not ready (status
+      {{ item.status | default('unreachable') }}).
+      {{ item.msg | default('') }}
+  loop: "{{ dfkv_verify_mds_ready.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Read the boot state of every dfkv unit
+  # is-active says the unit is running now; it says nothing about what happens
+  # after a reboot. A unit that is not enabled comes back as a machine with
+  # nothing running and no error anywhere to explain it -- and on a three node
+  # quorum that is one fewer member for the next failure to take out.
+  #
+  # `systemctl is-enabled` rather than the systemd module: this role is read-only
+  # by construction, and the module's `enabled: true` would fix a disabled unit
+  # instead of reporting it.
+  command:
+    cmd: "systemctl is-enabled {{ item.1 }}"
+  loop: "{{ dfkv_verify_units }}"
+  delegate_to: "{{ item.0 }}"
+  register: dfkv_verify_boot
+  changed_when: false
+  failed_when: false
+  loop_control:
+    label: "{{ item.0 }} {{ item.1 }}"
+
+- name: Fail when a unit would not come back after a reboot
+  assert:
+    that:
+      - (item.stdout | default('') | trim) == 'enabled'
+    fail_msg: >-
+      {{ item.item.1 }} on {{ item.item.0 }} is
+      "{{ (item.stdout | default('') | trim) or 'not installed' }}", not
+      'enabled'. `systemctl enable {{ item.item.1 }}` to fix it, then re-run
+      this playbook -- and treat the node as unverified until a reboot has
+      actually been through it.
+  loop: "{{ dfkv_verify_boot.results }}"
+  loop_control:
+    label: "{{ item.item.0 }} {{ item.item.1 }}"
+
 - name: Report
   debug:
     msg: >-
       verify: version={{ dfkv_version }} groups={{ dfkv_verify_groups | join(',') }}
       {{ dfkv_verify_counts | map(attribute='group') | zip(dfkv_verify_counts | map(attribute='total')) | map('join', '=') | join(' ') }}
+      | etcd={{ groups['etcd_servers'] | default([]) | length }} healthy,
+      mds={{ groups['mds_servers'] | default([]) | length }} ready,
+      units={{ dfkv_verify_units | length }} enabled

@@ -20,7 +20,7 @@
       - dfkv_observability_release_stat.stat.isdir | default(false)
     fail_msg: >-
       {{ dfkv_deploy_root }}/releases/{{ dfkv_version }}/{{ dfkv_observability_assets }}
-      is not staged on {{ inventory_hostname }}. Run playbooks/03_release.yml
+      is not staged on {{ inventory_hostname }}. Run playbooks/02_release.yml
       first. The stack renders from the observability assets inside the release,
       so its dashboards and alert rules always match the deployed binaries.
 
@@ -49,6 +49,53 @@
     dfkv_observability_compose_cmd: >-
       {{ (dfkv_observability_runtime if dfkv_observability_runtime | length > 0
           else dfkv_observability_runtime_detect.stdout) ~ ' compose' }}
+
+- name: Install the compose provider
+  # podman only: a node running docker gets `docker compose` from a package this
+  # role does not own.
+  package:
+    name: >-
+      {{ dfkv_observability_compose_provider_packages_debian
+         if ansible_os_family == 'Debian'
+         else dfkv_observability_compose_provider_packages_redhat }}
+    state: present
+  when:
+    - dfkv_observability_install_compose_provider | bool
+    - dfkv_observability_runtime_name == 'podman'
+  register: dfkv_observability_compose_provider
+  retries: 3
+  delay: 5
+  until: dfkv_observability_compose_provider is succeeded
+
+- name: Check that the compose invocation resolves to a working provider
+  # The install can succeed and still leave `podman compose` unable to find one.
+  # Catching it here names the cause; catching it at `compose up` reports it as a
+  # broken compose file.
+  command:
+    cmd: "{{ dfkv_observability_compose_cmd }} version"
+  register: dfkv_observability_compose_provider_check
+  changed_when: false
+  failed_when: false
+  # Skipped in check mode: the install above was only simulated, so a node
+  # without the package yet would fail an assertion about a state the dry run
+  # deliberately did not create.
+  when: not ansible_check_mode
+
+- name: Fail when no usable compose provider is available
+  assert:
+    that:
+      - dfkv_observability_compose_provider_check.rc | default(1) == 0
+    fail_msg: >-
+      `{{ dfkv_observability_compose_cmd }} version` exited
+      {{ dfkv_observability_compose_provider_check.rc | default('?') }}
+      on {{ inventory_hostname }}:
+      {{ dfkv_observability_compose_provider_check.stderr | default('') | trim }}
+
+      {{ dfkv_observability_runtime_name }} compose needs an external provider and
+      this node has no working one. Install
+      {{ dfkv_observability_compose_provider_packages_redhat | join(', ') }}, or
+      set dfkv_observability_install_compose_provider=true to have this role do it.
+  when: not ansible_check_mode
 
 # ---------------------------------------------------------------------------
 # The Grafana admin password.

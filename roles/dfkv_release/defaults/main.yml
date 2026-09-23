@@ -9,9 +9,44 @@
 # older launcher. A shared launcher would pass newer flags to an older binary.
 # The service roles install the unit, which points at current/<launcher>.
 
-# Which side of the cluster this node is. Derived from group membership, never
-# from the hostname -- see dfkv_deploy_root in inventory/group_vars/all.yml.
-dfkv_release_is_mds: "{{ inventory_hostname in (groups['mds_servers'] | default([])) }}"
+# The roles this node carries, derived from group membership (never the hostname).
+# A node may be BOTH an MDS and a cache node, so the unit of work is a list, not a
+# ternary -- the ternary silently staged only one launcher and restarted only one
+# service on such a node. MDS first: a server's first registration has a hard 60s
+# deadline and does not queue waiting for the MDS.
+dfkv_release_targets: >-
+  {{ ([{'role': 'mds',
+        'launcher': 'dfkv_mds_start.sh',
+        'service': dfkv_mds_service,
+        'metrics_port': dfkv_mds_metrics_port,
+        'ram_tier': false}]
+      if inventory_hostname in (groups['mds_servers'] | default([])) else [])
+     + ([{'role': 'server',
+           'launcher': 'dfkv_server_start.sh',
+           'service': dfkv_server_service,
+           'metrics_port': dfkv_server_metrics_port,
+           'ram_tier': true}]
+        if inventory_hostname in (groups['cache_servers'] | default([])) else []) }}
+
+# Every launcher a release directory carries, whoever staged it: a release has to
+# be the same tree everywhere, because the frozen launchers are what makes a
+# `current` flip a rollback. Unconditional, never derived from dfkv_release_targets
+# -- deriving would reintroduce the per-node asymmetry this list exists to prevent.
+# (The fleet tooling shipped both into every release directory too.)
+dfkv_release_launchers:
+  - dfkv_server_start.sh
+  - dfkv_mds_start.sh
+
+# Which of this node's roles a run activates; empty = all of them.
+# 90_upgrade.yml sets this per play -- it rolls MDS ahead of servers, and on a node
+# carrying both an unfiltered activation would restart its server twice.
+dfkv_release_activate_roles: []
+
+dfkv_release_activation_targets: >-
+  {{ dfkv_release_targets
+     if (dfkv_release_activate_roles | length == 0)
+     else (dfkv_release_targets
+           | selectattr('role', 'in', dfkv_release_activate_roles) | list) }}
 
 # Proxy for the control-node fetch. The control node has no `gh`, so releases
 # come over HTTPS; where that only works through a proxy, these carry it.
@@ -34,11 +69,7 @@ dfkv_release_source_tarball: >-
 # in-tarball manifest is the only check left.
 dfkv_release_expected_sha256: ""
 
-dfkv_release_launcher_name: "{{ 'dfkv_mds_start.sh' if dfkv_release_is_mds | bool else 'dfkv_server_start.sh' }}"
-dfkv_release_service: "{{ dfkv_mds_service if dfkv_release_is_mds | bool else dfkv_server_service }}"
-dfkv_release_metrics_port: "{{ dfkv_mds_metrics_port if dfkv_release_is_mds | bool else dfkv_server_metrics_port }}"
-
-# Stage-only by default. 03_release.yml leaves this false; 10_upgrade.yml sets
+# Stage-only by default. 02_release.yml leaves this false; 90_upgrade.yml sets
 # it true. Keeping both phases on one code path is deliberate: the fleet tooling
 # this replaces had a single switch_one() doing flip + restart + wait + verify,
 # and its rollback subcommand was literally the upgrade subcommand pointed at an
