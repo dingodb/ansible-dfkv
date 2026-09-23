@@ -16,7 +16,6 @@
 #      artifacts in place.
 
 dfkv_client_dir: ""
-dfkv_client_stage_dir: ""
 
 # Refuse to overwrite an existing published build with different bytes. A
 # silent overwrite would mean two nodes resolving the same path to different

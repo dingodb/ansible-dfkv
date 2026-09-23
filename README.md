@@ -32,17 +32,20 @@ ansible-dfkv/
 │   ├── hosts.yml                  sample inventory, six groups
 │   └── group_vars/all.yml         defaults; a region copies this and overrides
 ├── playbooks/
+│   ├── 00_check_config.yml        preflight: the region's group_vars is complete
 │   ├── 01_prepare.yml             packages, directories, RDMA check
-│   ├── 03_release.yml             fetch and stage a release (no restart)
-│   ├── 04_etcd.yml                bootstrap the etcd quorum (greenfield)
-│   ├── 05_mds.yml                 deploy dfkv_mds
-│   ├── 06_server.yml              deploy dfkv_server
+│   ├── 02_release.yml             fetch and stage a release (no restart)
+│   ├── 03_etcd.yml                bootstrap the etcd quorum (greenfield)
+│   ├── 04_mds.yml                 deploy dfkv_mds
+│   ├── 05_server.yml              deploy dfkv_server
+│   ├── 06_verify.yml              assert against the ring
 │   ├── 07_observability.yml       per-region telemetry stack
 │   ├── 08_client.yml              publish the client tree to shared storage
-│   ├── 09_verify.yml              assert against the ring
-│   ├── 10_upgrade.yml             rolling upgrade / rollback
+│   ├── 90_upgrade.yml             rolling upgrade / rollback
+│   ├── 91_uninstall.yml           remove dfkv (destructive; two gates)
 │   ├── 99_status.yml              read-only status report
-│   └── dfkv_site.yml              full greenfield bring-up
+│   ├── dfkv_site.yml              full bring-up: control plane + cache ring
+│   └── dfkv_gpu_site.yml          bring up a batch of cache (GPU) nodes
 └── roles/
     ├── dfkv_prepare/
     ├── dfkv_release/              stage + activate; owns the launchers
@@ -164,18 +167,53 @@ node serves misses until it refills. Run it in a window, and one node at a time:
 
 ## Deployment phases
 
-| Phase | Playbook | Target | What it does |
-|---|---|---|---|
-| 0 | `01_prepare.yml` | all | packages, directories, RDMA device check |
-| 1 | `03_release.yml` | MDS + cache | fetch once, push, stage |
-| 2 | `04_etcd.yml` | `etcd_servers` | bootstrap the quorum, serial 1 |
-| 3 | `05_mds.yml` | `mds_servers` | env, unit, start, wait for ready |
-| 4 | `06_server.yml` | `cache_servers` | data dirs, env, unit, start, wait for ready |
-| 5 | `09_verify.yml` | `admin` | ring and etcd assertions |
-| 6 | `07_observability.yml` | `observability_servers` | telemetry stack |
+Playbooks are numbered for the order they run in, so `ls playbooks/` reads as the
+deploy sequence: **00-08** are the bring-up chain, **90-98** are lifecycle actions
+(upgrade, uninstall), **99** is read-only.
 
-`dfkv_site.yml` runs all of them in order for a greenfield cluster. Each phase
-is also a standalone playbook — run it directly to re-apply just that phase.
+| Step | Playbook | Target | What it does |
+|---|---|---|---|
+| — | `00_check_config.yml` | all | preflight: the region's group_vars is complete |
+| 01 | `01_prepare.yml` | all | packages, directories, RDMA device check |
+| 02 | `02_release.yml` | MDS + cache | fetch once, push, stage |
+| 03 | `03_etcd.yml` | `etcd_servers` | bootstrap the quorum |
+| 04 | `04_mds.yml` | `mds_servers` | env, unit, start, wait for ready |
+| 05 | `05_server.yml` | `cache_servers` | data dirs, env, unit, start, wait for ready |
+| 06 | `06_verify.yml` | `admin` | ring, etcd and control-plane assertions |
+| 07 | `07_observability.yml` | `observability_servers` | telemetry stack |
+
+`dfkv_site.yml` runs all of them in order for a greenfield cluster. Each step is
+also a standalone playbook — run it directly to re-apply just that one.
+
+Three playbooks are outside the chain and are never part of a bring-up:
+`08_client.yml` (publishes client artifacts to a shared filesystem, which is not
+a step in starting a region), `90_upgrade.yml` and `91_uninstall.yml` (lifecycle
+actions), and `99_status.yml` (read-only report).
+
+### Two entry points, one command each
+
+Both are idempotent: a re-run against unchanged inputs reports no
+changes.
+
+| what | command | phases it runs |
+|---|---|---|
+| the whole region | `dfkv_site.yml` | 00-07, each against its own group |
+| a batch of cache (GPU) nodes | `dfkv_gpu_site.yml` | `prepare` + `release` + `server` |
+
+The first composes imported *playbooks*, because its phases each target a
+different group (`etcd_servers`, then `mds_servers`, then `cache_servers`). The
+second has a single host set -- `cache_servers` -- so it composes three *roles*
+in one play instead, which is both shorter and harder to get wrong.
+
+`05_server.yml` and `08_client.yml` remain as the single-phase entry points, for
+re-applying just that step once the release is already staged.
+
+**Two different things are called "client" in this domain, and only one of them
+is dfkv's.** The cache nodes are the GPU machines, and their dfkv process is
+`dfkv_server` -- a server, in the `cache_servers` group. dfkv's actual client is
+the library inside the inference process (`libdfkv.so`, the `dfkv_connector` and
+`dfkv_vllm` packages); it is *published* to a shared filesystem rather than
+deployed to a node, which is what `08_client.yml` does.
 
 **There is deliberately no host-tuning phase.** The obvious candidates do not
 apply: the load-bearing limits (`LimitMEMLOCK`, `LimitNOFILE`, `TimeoutStartSec`,
@@ -242,14 +280,14 @@ budget against an older artifact gets a server that silently ignores it.
 
 ```bash
 # 1. stage. Never restarts anything; always safe to run ahead of the window.
-ansible-playbook -i <inv> playbooks/03_release.yml -e dfkv_version=2.29.0
+ansible-playbook -i <inv> playbooks/02_release.yml -e dfkv_version=2.29.0
 
 # 2. activate. MDS first (serial 1), then servers in batches.
-ansible-playbook -i <inv> playbooks/10_upgrade.yml -e dfkv_version=2.29.0 \
+ansible-playbook -i <inv> playbooks/90_upgrade.yml -e dfkv_version=2.29.0 \
                  -e dfkv_upgrade_batch=4
 
 # 3. roll back the same way
-ansible-playbook -i <inv> playbooks/10_upgrade.yml -e dfkv_version=2.28.0
+ansible-playbook -i <inv> playbooks/90_upgrade.yml -e dfkv_version=2.28.0
 ```
 
 Activation per node is: RAM gate → flip `current` → restart → poll the metrics
@@ -274,7 +312,7 @@ which passes.
 ## Verification
 
 ```bash
-ansible-playbook -i <inv> playbooks/09_verify.yml
+ansible-playbook -i <inv> playbooks/06_verify.yml
 ```
 
 Verification asserts against **the ring**, not against the inventory. That
@@ -371,14 +409,14 @@ from this repo and override, rather than expecting the two to merge.
 | Playbook | Default target | Purpose |
 |---|---|---|
 | `01_prepare.yml` | all | packages and directories; re-run safe |
-| `03_release.yml` | MDS + cache | stage a release; never restarts |
-| `04_etcd.yml` | `etcd_servers` | greenfield etcd only; refuses if already active |
-| `05_mds.yml` | `mds_servers` | deploy or reconverge MDS |
-| `06_server.yml` | `cache_servers` | deploy or reconverge servers |
+| `02_release.yml` | MDS + cache | stage a release; never restarts |
+| `03_etcd.yml` | `etcd_servers` | greenfield etcd only; refuses if already active |
+| `04_mds.yml` | `mds_servers` | deploy or reconverge MDS |
+| `05_server.yml` | `cache_servers` | deploy or reconverge servers |
 | `07_observability.yml` | `observability_servers` | telemetry stack |
 | `08_client.yml` | `client_stage` | publish the client tree |
-| `09_verify.yml` | `admin` | ring and etcd assertions |
-| `10_upgrade.yml` | MDS + cache | rolling upgrade; also the rollback path |
+| `06_verify.yml` | `admin` | ring and etcd assertions |
+| `90_upgrade.yml` | MDS + cache | rolling upgrade; also the rollback path |
 | `99_status.yml` | all | read-only report |
 
 Operation switches, all via `-e`:

@@ -22,7 +22,7 @@
 #
 # Expects dfkvctl. Runs from the admin group against one representative node.
 #
-#   ansible-playbook -i <inv> playbooks/09_verify.yml
+#   ansible-playbook -i <inv> playbooks/06_verify.yml
 - name: Verify the dfkv cluster
   hosts: admin
   remote_user: root

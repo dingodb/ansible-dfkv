@@ -2,8 +2,8 @@
 # Stage a dfkv release onto this node, and optionally activate it.
 #
 # Two entry points, one implementation:
-#   playbooks/03_release.yml  -> staging only
-#   playbooks/10_upgrade.yml  -> staging is a no-op, then activation
+#   playbooks/02_release.yml  -> staging only
+#   playbooks/90_upgrade.yml  -> staging is a no-op, then activation
 #
 # Activation = RAM gate, flip `current`, restart, wait for the new version to
 # report itself, RAM gate again. There is no separate rollback path: pointing
@@ -142,47 +142,63 @@
   when: dfkv_release_staged.stat.exists
   failed_when: false
 
-- name: Default the staged launcher checksum to "unknown"
+- name: Default the staged launcher digest to "unknown"
   set_fact:
-    dfkv_release_staged_launcher_sha256: ""
+    dfkv_release_staged_launcher_set_sha256: ""
 
-- name: Read the staged release's launcher checksum
-  # A release directory with no marker, or an unreadable one, was not staged by
-  # this repo -- the fleet tooling it replaces left bare directories behind. That
-  # resolves to "unknown", which fails the assert below with the intended
-  # message instead of a JSON parse error.
+- name: Read the staged release's launcher digest
+  # No marker, or an unreadable one, means this repo did not stage it -- the fleet
+  # tooling left bare directories behind. Resolves to "unknown", which trips the
+  # assert below with its intended message instead of a JSON parse error.
   when: dfkv_release_staged.stat.exists
   block:
     - name: Parse the release marker
       set_fact:
-        dfkv_release_staged_launcher_sha256: >-
-          {{ (dfkv_release_marker.content | b64decode | from_json).launcher_sha256 | default('') }}
+        dfkv_release_staged_launcher_set_sha256: >-
+          {{ (dfkv_release_marker.content | b64decode | from_json).launcher_set_sha256 | default('') }}
   rescue:
     - name: Treat an unreadable marker as a release this repo did not stage
       set_fact:
-        dfkv_release_staged_launcher_sha256: ""
+        dfkv_release_staged_launcher_set_sha256: ""
 
-- name: Checksum the launcher this repo would stage
-  # Not run_once: the marker comparison below is per-host, and a run_once result
-  # would only be populated on one of them.
+- name: Checksum the launchers this repo would stage
+  # Not run_once: the comparison below is per-host, and a run_once result would
+  # only be populated on one of them.
   stat:
-    path: "{{ role_path }}/files/{{ dfkv_release_launcher_name }}"
+    path: "{{ role_path }}/files/{{ item }}"
     checksum_algorithm: sha256
+  loop: "{{ dfkv_release_launchers }}"
   delegate_to: localhost
   become: false
-  register: dfkv_release_launcher_stat
+  register: dfkv_release_launcher_stats
 
-- name: Fail when a staged release was built from a different launcher
+- name: Reduce the launcher set to one comparable value
+  # One hex string, not a list of pairs: zip yields tuples and from_json yields
+  # lists, and Python does not consider ('a', 'x') equal to ['a', 'x'] -- so a
+  # list would fail the gate on a correctly staged release.
+  # Sorted by name, so the digest does not depend on the order of the list.
+  set_fact:
+    dfkv_release_local_launcher_set_sha256: >-
+      {{ dfkv_release_launcher_stats.results
+         | sort(attribute='item')
+         | map(attribute='item') | list
+         | zip(dfkv_release_launcher_stats.results
+               | sort(attribute='item')
+               | map(attribute='stat.checksum') | list)
+         | map('join', ':') | join('\n') | hash('sha256') }}
+
+- name: Fail when a staged release was built from a different launcher set
   assert:
     that:
-      - dfkv_release_staged_launcher_sha256 == dfkv_release_launcher_stat.stat.checksum
+      - dfkv_release_staged_launcher_set_sha256 == dfkv_release_local_launcher_set_sha256
     fail_msg: >-
-      {{ dfkv_deploy_root }}/releases/{{ dfkv_version }} is already staged, and
-      the launcher it carries differs from the one this repo would write. A
-      release directory is immutable because the launcher inside it is what a
-      rollback would run -- rewriting it silently would invalidate the rollback
-      target. Either bump the version, remove that directory deliberately, or
-      re-stage this one with -e dfkv_release_allow_restage=true.
+      {{ dfkv_deploy_root }}/releases/{{ dfkv_version }} is already staged, and the
+      launcher set it carries differs from the one this repo would write
+      (staged {{ dfkv_release_staged_launcher_set_sha256 | default('unknown', true) }},
+      would write {{ dfkv_release_local_launcher_set_sha256 }}).
+      A release directory is immutable because the launchers inside it are what a
+      rollback would run. Either bump the version, remove that directory
+      deliberately, or re-stage with -e dfkv_release_allow_restage=true.
   when:
     - dfkv_release_staged.stat.exists
     - not (dfkv_release_allow_restage | bool)
@@ -287,20 +303,26 @@
         group: root
         recurse: true
 
-    - name: Copy the launcher into the release
+    - name: Copy the launchers into the release
+      # All of them, not just this node's: the unit a node runs execs
+      # current/<its own launcher>, and the tree must be identical everywhere.
       copy:
-        src: "{{ role_path }}/files/{{ dfkv_release_launcher_name }}"
-        dest: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}{{ dfkv_release_tmp_suffix }}/{{ dfkv_release_launcher_name }}"
+        src: "{{ role_path }}/files/{{ item }}"
+        dest: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}{{ dfkv_release_tmp_suffix }}/{{ item }}"
         mode: "0755"
+      loop: "{{ dfkv_release_launchers }}"
 
     - name: Write the release marker
       copy:
         # No timestamp: this content has to be a pure function of the inputs, or
         # every run would rewrite it and report a change.
+        #
+        # `launchers` is for whoever reads the directory; the gate compares
+        # `launcher_set_sha256`.
         content: >-
           {{ {'version': dfkv_version,
-              'launcher': dfkv_release_launcher_name,
-              'launcher_sha256': dfkv_release_launcher_stat.stat.checksum} | to_nice_json }}
+              'launchers': dfkv_release_launchers,
+              'launcher_set_sha256': dfkv_release_local_launcher_set_sha256} | to_nice_json }}
         dest: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}{{ dfkv_release_tmp_suffix }}/.dfkv-release.json"
         mode: "0644"
 
@@ -336,49 +358,61 @@
 # Activate
 # ---------------------------------------------------------------------------
 - name: Activate the release
-  when: dfkv_release_activate | bool
+  # Skipped when this run targets no role this node carries: 90_upgrade.yml runs
+  # two plays over groups a region may overlap.
+  when:
+    - dfkv_release_activate | bool
+    - dfkv_release_activation_targets | length > 0
   block:
     - name: Read the RAM tier rollout gate before restarting
-      # A server with a healthy RAM tier and unwritten dirty data loses
-      # acknowledged writes when it restarts. The gate is skipped for MDS, which
-      # has no RAM tier, and passes automatically for servers that have it off.
+      # A server with unwritten dirty data loses acknowledged writes when it
+      # restarts. Per target: the gate belongs to the server, so an MDS
+      # (ram_tier: false) is skipped. A missing dfkv_ram_healthy metric means the
+      # RAM tier is off, which passes.
       uri:
-        url: "http://127.0.0.1:{{ dfkv_release_metrics_port }}/metrics"
+        url: "http://127.0.0.1:{{ item.metrics_port }}/metrics"
         return_content: true
         status_code: [200]
       register: dfkv_release_pre_gate
       changed_when: false
       failed_when: false
-      when: not (dfkv_release_is_mds | bool)
+      loop: "{{ dfkv_release_activation_targets }}"
+      loop_control:
+        label: "{{ item.service }}"
+      when: item.ram_tier
 
     - name: Fail the rollout when the RAM tier is not quiescent
       assert:
         that:
           - >-
-            (dfkv_release_pre_gate.content | default('')
+            (item.content | default('')
              | regex_findall('(?m)^dfkv_ram_healthy\s+(\S+)') + ['']) | first in ['', '1']
           - >-
-            ((dfkv_release_pre_gate.content | default('')
+            ((item.content | default('')
               | regex_findall('(?m)^dfkv_ram_post_ack_flush_failures_total\s+(\S+)') + ['0']) | first | int) == 0
           - >-
-            ((dfkv_release_pre_gate.content | default('')
+            ((item.content | default('')
               | regex_findall('(?m)^dfkv_ram_dirty_bytes\s+(\S+)') + ['0']) | first | int)
             <= dfkv_ram_rollout_max_dirty_bytes
           - >-
-            ((dfkv_release_pre_gate.content | default('')
+            ((item.content | default('')
               | regex_findall('(?m)^dfkv_ram_oldest_dirty_age_seconds\s+(\S+)') + ['0']) | first | int)
             <= dfkv_ram_rollout_max_dirty_age_s
         fail_msg: >-
-          Refusing to restart: the RAM tier on {{ inventory_hostname }} still
-          holds acknowledged writes (dirty={{ (dfkv_release_pre_gate.content
+          Refusing to restart {{ item.item.service }}: the RAM tier on
+          {{ inventory_hostname }} still holds acknowledged writes (dirty={{ (item.content
           | default('') | regex_findall('(?m)^dfkv_ram_dirty_bytes\s+(\S+)') + ['?']) | first }},
-          age={{ (dfkv_release_pre_gate.content
+          age={{ (item.content
           | default('') | regex_findall('(?m)^dfkv_ram_oldest_dirty_age_seconds\s+(\S+)') + ['?']) | first }}s).
-          Wait for the flush to catch up and re-run. A missing dfkv_ram_healthy
-          metric means the RAM tier is off, which passes this gate.
-      when: not (dfkv_release_is_mds | bool)
+          Wait for the flush to catch up and re-run.
+      loop: "{{ dfkv_release_pre_gate.results }}"
+      loop_control:
+        label: "{{ item.item.service }}"
+      when: item.item.ram_tier
 
     - name: Point current at the new release
+      # Once per node, not per target: every service execs current/<its launcher>
+      # out of the same release directory.
       file:
         src: "{{ dfkv_deploy_root }}/releases/{{ dfkv_version }}"
         dest: "{{ dfkv_deploy_root }}/current"
@@ -386,18 +420,22 @@
         force: true
       register: dfkv_release_flip
 
-    - name: Restart the service
+    - name: Restart the services this run activates
+      # In dfkv_release_activation_targets order, which puts the MDS first.
       systemd:
-        name: "{{ dfkv_release_service }}"
+        name: "{{ item.service }}"
         state: restarted
         daemon_reload: true
+      loop: "{{ dfkv_release_activation_targets }}"
+      loop_control:
+        label: "{{ item.service }}"
 
-    - name: Wait for the service to report the new version
+    - name: Wait for each service to report the new version
       # The version comes from the process's own metrics endpoint, not from the
       # symlink. The symlink is a statement of intent; this is the only thing
       # that proves the new binary is the one actually serving.
       uri:
-        url: "http://127.0.0.1:{{ dfkv_release_metrics_port }}/metrics"
+        url: "http://127.0.0.1:{{ item.metrics_port }}/metrics"
         return_content: true
         status_code: [200]
       register: dfkv_release_post_ready
@@ -407,27 +445,36 @@
       delay: "{{ dfkv_release_ready_delay }}"
       changed_when: false
       failed_when: false
+      loop: "{{ dfkv_release_activation_targets }}"
+      loop_control:
+        label: "{{ item.service }}"
 
-    - name: Fail when the service did not come up on the new version
+    - name: Fail when a service did not come up on the new version
       assert:
         that:
           - >-
-            ('version="' ~ dfkv_version ~ '"') in (dfkv_release_post_ready.content | default(''))
+            ('version="' ~ dfkv_version ~ '"') in (item.content | default(''))
         fail_msg: >-
-          {{ dfkv_release_service }} on {{ inventory_hostname }} did not report
+          {{ item.item.service }} on {{ inventory_hostname }} did not report
           version {{ dfkv_version }} within
           {{ dfkv_release_ready_retries | int * dfkv_release_ready_delay | int }}s.
           `current` now points at the new release; check `systemctl status
-          {{ dfkv_release_service }}` and `journalctl -u {{ dfkv_release_service }}`.
+          {{ item.item.service }}` and `journalctl -u {{ item.item.service }}`.
           To go back, run this playbook again with the previous version.
+      loop: "{{ dfkv_release_post_ready.results }}"
+      loop_control:
+        label: "{{ item.item.service }}"
 
     - name: Confirm the RAM tier recovered
       assert:
         that:
           - >-
-            (dfkv_release_post_ready.content | default('')
+            (item.content | default('')
              | regex_findall('(?m)^dfkv_ram_healthy\s+(\S+)') + ['']) | first in ['', '1']
         fail_msg: >-
           The RAM tier on {{ inventory_hostname }} did not come back healthy
-          after restart.
-      when: not (dfkv_release_is_mds | bool)
+          after restarting {{ item.item.service }}.
+      loop: "{{ dfkv_release_post_ready.results }}"
+      loop_control:
+        label: "{{ item.item.service }}"
+      when: item.item.ram_tier

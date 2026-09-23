@@ -1,18 +1,18 @@
 ---
 # Playbook: Deploy dfkv_server on the cache nodes.
 #
-# Assumes the release is already staged (03_release.yml).
+# Assumes the release is already staged (02_release.yml).
 #
 # Not serial: this is the *first* deploy of the ring, where nothing is serving
-# yet. Use 10_upgrade.yml to move an already-serving ring forward.
+# yet. Use 90_upgrade.yml to move an already-serving ring forward.
 #
 # The role creates the data directories, renders the node's environment file from
 # this host's variables, installs the launcher and unit, and starts the service.
 # Re-running it does not restart a healthy server -- configuration and unit
 # templates notify handlers only when their content changes.
 #
-#   ansible-playbook -i <inv> playbooks/06_server.yml
-#   ansible-playbook -i <inv> playbooks/06_server.yml --limit dfkv-cache-1
+#   ansible-playbook -i <inv> playbooks/05_server.yml
+#   ansible-playbook -i <inv> playbooks/05_server.yml --limit dfkv-cache-1
 - name: Deploy dfkv_server
   hosts: "{{ target_hosts | default('cache_servers') }}"
   remote_user: root

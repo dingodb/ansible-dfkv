@@ -7,7 +7,7 @@
 # when a cluster and the inventory disagree.
 #
 # For the full assertion set (ring membership, etcd registration counts, RDMA
-# depth, RAM arena size) use 09_verify.yml instead -- that one fails, this one
+# depth, RAM arena size) use 06_verify.yml instead -- that one fails, this one
 # only reports.
 #
 #   ansible-playbook -i <inv> playbooks/99_status.yml
@@ -69,7 +69,7 @@
               # The listener is not serving yet. That is what a node looks like
               # for the first 1-2 minutes after a restart: the RAM arena is
               # pre-touched and the RDMA MRs are registered before metrics come
-              # up, which is why 06_server waits on /readyz rather than assuming.
+              # up, which is why 05_server waits on /readyz rather than assuming.
               printf '%s=not-serving-yet (service active -- still starting, or wedged)\n' "$svc"
             else
               printf '%s=unreachable (service %s)\n' "$svc" "$st"
